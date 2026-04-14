@@ -1,6 +1,6 @@
 # RNAseq_GBRS
 
-Genome-based RNA-seq (GBRS) pipeline for allele-specific expression (ASE) quantification in Collaborative Cross (CC) and CCRIX mice. GBRS leverages the known founder haplotype structure of CC mice to reconstruct local genotypes from RNA-seq reads and quantify strain-specific expression.
+Genome Reconstruction by RNA-Seq (GBRS) pipeline for allele-specific expression (ASE) quantification in Collaborative Cross (CC), CC-RIX, and Diversity Outbred (DO) mice. GBRS leverages the known founder haplotype structure of CC mice to reconstruct local genotypes from RNA-seq reads and quantify founder strain-specific expression.
 
 ## Overview
 
