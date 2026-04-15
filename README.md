@@ -2,6 +2,8 @@
 
 Genome Reconstruction by RNA-Seq (GBRS) pipeline for allele-specific expression (ASE) quantification in Collaborative Cross (CC), CC-RIX, and Diversity Outbred (DO) mice. GBRS leverages the known founder haplotype structure of CC mice to reconstruct local genotypes from RNA-seq reads and quantify founder strain-specific expression.
 
+A key contribution of this repository is the novel implementation of GBRS for CC and CCRIX mice (`3_CC_Implementation/`), including generation of CC-specific transition probability matrices required for genotype reconstruction.
+
 ## Overview
 
 GBRS uses RNA-seq reads to simultaneously perform:
@@ -14,8 +16,9 @@ This approach is based on [Choi et al. 2021 (GBRS)](https://github.com/churchill
 
 ```
 RNAseq_GBRS/
-├── 1_GBRS_Pipeline/      # HPC SLURM scripts: alignment → quantification → genotype reconstruction
-└── 2_GBRS_Analysis/      # R Markdown: transition probability modeling, ASE analysis
+├── 1_GBRS_Pipeline/       # HPC SLURM scripts: alignment → quantification → genotype reconstruction
+├── 2_GBRS_Analysis/       # R Markdown: ASE visualization and interpretation
+└── 3_CC_Implementation/   # Novel CC/CCRIX transition probability generation and data files
 ```
 
 ## Workflow
@@ -37,8 +40,7 @@ Preprocessed FASTQs (from RNAseq_STAR)
     └── Genotype export
     │
     ▼
-2_GBRS_Analysis
-    ├── Transition probability matrix generation (CC founders)
+2_GBRS_Analysis             ← uses transition probability files from 3_CC_Implementation/
     └── ASE visualization and interpretation
 ```
 
@@ -48,15 +50,6 @@ Preprocessed FASTQs (from RNAseq_STAR)
 |-------|-------|
 | HPC pipeline | GBRS, Bowtie2, SAMtools, EMASE, SLURM |
 | R analysis | R, GBRS R package, ape, ggplot2 |
-
-## Data Files (in `2_GBRS_Analysis/`)
-
-| File | Description |
-|------|-------------|
-| `tranprob.CC.G20.F.h5` / `.M.h5` | CC founder transition probability matrices (female/male), generation 20 |
-| `tranprob.CC.G20.F.npz` / `.M.npz` | Same as above in NumPy compressed format |
-| `RIX_CC001xCC019.F.h5` | CCRIX transition probability file |
-| `Data/CC_indexes/` | Haplotype concordance and strain index files for CC001, CC019, CC040 |
 
 ## Related Repository
 
