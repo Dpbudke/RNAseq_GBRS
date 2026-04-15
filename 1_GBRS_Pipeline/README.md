@@ -34,6 +34,12 @@ sbatch 3_bam_sort_index.slurm
 # etc.
 ```
 
+## Reference Data
+
+The diploid transcriptome and founder genome files required by these scripts are archived on Zenodo (Dawson Budke is a contributor):
+
+> Lloyd, Michael. (2025). *Reference Data for EMASE and GBRS*. Zenodo. https://doi.org/10.5281/zenodo.15091310
+
 ## Notes
 
 - Scripts were developed for CC pup ASE analysis; extending to CCRIX requires generation of CCRIX-specific transition probability files (see `2_GBRS_Analysis/`)

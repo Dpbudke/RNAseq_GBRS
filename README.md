@@ -51,6 +51,14 @@ Preprocessed FASTQs (from RNAseq_STAR)
 | HPC pipeline | GBRS, Bowtie2, SAMtools, EMASE, SLURM |
 | R analysis | R, GBRS R package, ape, ggplot2 |
 
+## Reference Data
+
+Reference files required for EMASE and GBRS (diploid transcriptome, founder genomes, etc.) are archived on Zenodo:
+
+> Lloyd, Michael. (2025). *Reference Data for EMASE and GBRS*. Zenodo. https://doi.org/10.5281/zenodo.15091310
+
+Dawson Budke is a contributor to this dataset.
+
 ## Related Repository
 
 Standard STAR alignment and DE analysis pipeline: [RNAseq_STAR](https://github.com/Dpbudke/RNAseq_STAR)
