@@ -1,0 +1,4469 @@
+---
+title: "CCRIX_GBRS_Testing"
+author: "Dawson Budke"
+date: "2025-04-08"
+---
+
+## 1. Load in Files
+
+```{r}
+# Clear environment to start fresh (if necessary)
+rm(list = ls())
+
+#UNC/Jackson labs genotyping microarray consensus file
+CC_diplotype_probs <- readRDS("Data/CC_diplotype_probs.rds")
+
+#Anno for above 
+anno = read.csv("Data/gm_uwisc_v4.csv")
+# check mini experiment below: v4 including markers annotated to bp_grcm39, which was used in my GBRS samples, so its the superior annotation here 
+
+# Grcm39 v105 Ensembl anno 
+
+```
+
+## 2. Filter CC_diplotypes files
+
+```{r}
+# Function to filter CC_diplotype_probs to only include specified strains
+filter_diplotype_probs <- function(gprob, strain_patterns) {
+  # Create a filtered copy of the genoprob object
+  filtered_gprob <- gprob
+  
+  # Get all sample names from the first chromosome (they should be the same across all chromosomes)
+  all_samples <- dimnames(gprob[[1]])[[1]]
+  
+  # Find samples matching the patterns
+  matching_indices <- integer(0)
+  matching_samples <- character(0)
+  
+  for (pattern in strain_patterns) {
+    matches <- grep(pattern, all_samples, ignore.case = TRUE)
+    if (length(matches) > 0) {
+      matching_indices <- c(matching_indices, matches)
+      matching_samples <- c(matching_samples, all_samples[matches])
+    }
+  }
+  
+  # Check if we found any matches
+  if (length(matching_indices) == 0) {
+    stop("No samples found matching the specified patterns")
+  }
+  
+  # Print the matched samples for verification
+  cat("Found", length(matching_samples), "samples matching your criteria:\n")
+  cat(paste(matching_samples, collapse = "\n"), "\n")
+  
+  # Filter each chromosome to keep only the matched samples
+  for (chr_name in names(gprob)) {
+    filtered_gprob[[chr_name]] <- gprob[[chr_name]][matching_indices, , , drop = FALSE]
+  }
+  
+  # Return the filtered object with all attributes preserved
+  attributes(filtered_gprob) <- attributes(gprob)
+  return(filtered_gprob)
+}
+
+# Use the function with your strain patterns
+strain_patterns <- c("CC001/Unc", "CC019/TauUnc", "CC040/TauUnc")
+filtered_CC_diplotype_probs <- filter_diplotype_probs(CC_diplotype_probs, strain_patterns)
+
+# Check the dimensions of the first chromosome in the filtered data
+dim(filtered_CC_diplotype_probs[[1]])
+
+# You can also verify the sample names in the filtered data
+filtered_samples <- dimnames(filtered_CC_diplotype_probs[[1]])[[1]]
+print(filtered_samples)
+
+# Save the filtered data if needed
+
+```
+
+## 3. Load in Metadata
+
+```{r}
+# CCRIX samples (176) 
+
+# Load in Excel file and read the "pups" sheet
+pup <- read.xlsx("Data/Data4R_db_03102025_FINAL.xlsx", sheet = "Pups", na.strings = c(""," ","NA","N/A","na", "n/a"), skipEmptyRows = TRUE)
+
+# Add Cross column 
+pup$Cross <- paste0(pup$CC.Mom.Strain, "x", pup$CC.Dad.Strain)
+
+#Edit Low Protein to LP and AIN-93G to AIN (removing space/- since it messes up contrasts function)
+pup$Diet <- gsub("Low Protein", "LP", pup$Diet)
+pup$Diet <- gsub("AIN-93G", "AIN", pup$Diet)
+
+# Select only the required columns
+
+```
+
+```{r}
+# Control Pups (70 samples)
+
+# Load in Excel file and read the "ControlPups" sheet
+ControlPup <- read.xlsx("Data/Data4R_db_03102025_FINAL.xlsx", sheet = "ControlPups", na.strings = c(""," ","NA","N/A","na", "n/a"), skipEmptyRows = TRUE)
+
+# Add Cross column 
+ControlPup$Cross <- paste0(ControlPup$CC.Mom.Strain, "x", ControlPup$CC.Dad.Strain)
+
+#Edit Low Protein to LP and AIN-93G to AIN (removing space/- since it messes up contrasts function)
+ControlPup$Diet <- gsub("Low Protein", "LP", ControlPup$Diet)
+ControlPup$Diet <- gsub("AIN-93G", "AIN", ControlPup$Diet)
+
+# Select only the required columns
+
+```
+
+## 4. Interpolate markers to gene positions
+
+```{r}
+## Interpolate CC Diplotype Probabilities to Gene Positions
+## This script uses the interpolation code to map marker-based probabilities to gene positions
+
+# Load required libraries
+library(IRanges)
+library(qtl2convert) # You might need to install this
+library(qtl2)        # You might need to install this
+library(data.table)
+library(dplyr)
+
+# Define interpolation functions
+interpolate_one_chr = function(pr1, mkr1, mkr2) {
+  
+  # Verify that the marker names in pr1 and mkr1 are identical and in the same
+  # order.
+  stopifnot(dimnames(pr1)[[3]] == names(mkr1))
+  
+  # Verify that the markers are in bp and not Mbp.
+  stopifnot(min(mkr1) > 200)
+  stopifnot(min(mkr2) > 200)
+
+  # Convert markers to IRanges to used inter-range functions.
+  mkr1 = IRanges(start = mkr1, width = 1, names = names(mkr1))
+  mkr2 = IRanges(start = mkr2, width = 1, names = names(mkr2))
+  
+  # The the proximal and distal markers in mkr1 which bracket the markers
+  # in mkr2.
+  proximal = follow(mkr2,  mkr1)
+  distal   = precede(mkr2, mkr1)
+  proximal[is.na(proximal)] = 1
+  distal[is.na(distal)]     = length(mkr1)
+  
+  # Ensure indices are within the range
+  proximal[proximal > dim(pr1)[3]] = dim(pr1)[3]
+  distal[distal     > dim(pr1)[3]] = dim(pr1)[3]
+  
+  # Get the proximal and distal probs.
+  prox_pr = pr1[,,proximal, drop = FALSE]
+  dist_pr = pr1[,,distal,   drop = FALSE]
+  
+  # interpolate values
+  mkr_interp = (start(mkr2) - start(mkr1)[proximal]) / (start(mkr1)[distal] - start(mkr1)[proximal])
+  mkr_interp[is.infinite(mkr_interp)] = 1
+  mkr_interp = array(rep(mkr_interp, each = nrow(pr1) * ncol(pr1)),
+                     c(nrow(pr1), ncol(pr1), length(mkr2)),
+                     dimnames = list(rownames(pr1), colnames(pr1), names(mkr2)))
+
+  # Create the new probs array.
+  tmp = prox_pr + (mkr_interp) * (dist_pr - prox_pr)
+  dimnames(tmp)[[3]] = names(mkr2)
+  return(tmp)
+}
+
+# Top-level interpolate function.
+interpolate_genoprobs = function(probs1, markers1, markers2) {
+
+  # Perform some minimal error checking. 
+  if(length(probs1) != length(markers1)) {
+    stop('Probs1 and markers1 must be the same length.')
+  }
+
+  # If the marker maps are in Mb, convert to bp.
+  if(max(unlist(markers1) < 200)) {
+    markers1 = lapply(markers1, '*', 1e6)
+  }
+
+  if(max(unlist(markers2) < 200)) {
+    markers2 = lapply(markers2, '*', 1e6)
+  }
+  
+  all_chr = names(probs1)
+
+  new_probs1        = vector('list', length(probs1))
+  names(new_probs1) = names(probs1)
+
+  for(chr in all_chr) {
+    new_probs1[[chr]] = interpolate_one_chr(pr1  = probs1[[chr]],
+                                           mkr1 = markers1[[chr]],
+                                           mkr2 = markers2[[chr]])
+  }
+
+  # Set the attributes for the probs object.
+  attr(new_probs1, 'crosstype')    = attr(probs1, 'crosstype')
+  attr(new_probs1, 'is_x_chr')     = attr(probs1, 'is_x_chr')
+  attr(new_probs1, 'alleles')      = attr(probs1, 'alleles')
+  attr(new_probs1, 'alleleprobs')  = attr(probs1, 'alleleprobs')
+  class(new_probs1)                = class(probs1)
+  
+  return(new_probs1)
+}
+
+# Step 1: Print info about existing data objects
+cat("Examining existing data objects...\n")
+cat("Dimensions of annotation data:", dim(anno), "\n")
+cat("Dimensions of gene data:", dim(genes_with_id), "\n")
+
+# Show chromosome distributions
+cat("\nChromosome distribution in anno:\n")
+print(table(anno$chr))
+
+cat("\nChromosome distribution in genes_with_id:\n")
+print(table(genes_with_id$chromosome_name))
+
+cat("\nStructure of filtered_CC_diplotype_probs:\n")
+for (chr in names(filtered_CC_diplotype_probs)) {
+  chr_array <- filtered_CC_diplotype_probs[[chr]]
+  cat("Chromosome", chr, "dimensions:", paste(dim(chr_array), collapse=" x "), "\n")
+  cat("  Samples:", paste(dimnames(chr_array)[[1]], collapse=", "), "\n")
+  cat("  Founders:", paste(dimnames(chr_array)[[2]], collapse=", "), "\n")
+  cat("  First few markers:", paste(head(dimnames(chr_array)[[3]], 3), collapse=", "), "\n")
+}
+
+# Step 2: Format marker data into qtl2 format
+cat("\nFormatting marker data...\n")
+markers_list <- list()
+skipped_chrs <- character(0)
+
+for (chr in names(filtered_CC_diplotype_probs)) {
+  # Get the chromosome number without "chr" prefix
+  chr_num <- gsub("^chr", "", chr)
+  
+  # Find markers for this chromosome in anno
+  anno_chr <- anno[anno$chr == chr_num, ]
+  
+  if (nrow(anno_chr) == 0) {
+    cat("Warning: No markers found in anno for chromosome", chr, "\n")
+    skipped_chrs <- c(skipped_chrs, chr)
+    next
+  }
+  
+  # Get marker positions
+  marker_pos <- anno_chr$bp_mm10
+  names(marker_pos) <- anno_chr$marker
+  
+  # Get marker names from probability data
+  prob_markers <- dimnames(filtered_CC_diplotype_probs[[chr]])[[3]]
+  
+  # Check for marker name match
+  matching_markers <- intersect(names(marker_pos), prob_markers)
+  
+  if (length(matching_markers) > 0) {
+    cat("Found", length(matching_markers), "matching markers for chromosome", chr, "\n")
+    
+    # Keep only matching markers in the same order as in probability data
+    matching_indices <- match(matching_markers, prob_markers)
+    matching_markers_ordered <- prob_markers[sort(matching_indices)]
+    
+    # Create a subset of markers
+    marker_pos_subset <- marker_pos[matching_markers_ordered]
+    
+    # Store the marker positions
+    markers_list[[chr]] <- marker_pos_subset
+  } else {
+    cat("No matching marker names for chromosome", chr, "\n")
+    
+    # Instead of using synthetic positions, we'll try to map based on position ordering
+    # This assumes that both lists are ordered by genomic position
+    marker_count <- length(prob_markers)
+    
+    if (length(marker_pos) >= marker_count) {
+      # Sample positions at regular intervals
+      indices <- round(seq(1, length(marker_pos), length.out = marker_count))
+      sampled_pos <- marker_pos[indices]
+      names(sampled_pos) <- prob_markers
+      markers_list[[chr]] <- sampled_pos
+      cat("Mapped", length(sampled_pos), "markers using position-based assignment\n")
+    } else {
+      cat("Warning: Not enough markers in anno for chromosome", chr, "\n")
+      cat("Skipping chromosome", chr, "due to insufficient marker data\n")
+      skipped_chrs <- c(skipped_chrs, chr)
+    }
+  }
+}
+
+# Report on skipped chromosomes
+if (length(skipped_chrs) > 0) {
+  cat("\nThe following chromosomes were skipped due to insufficient marker data:\n")
+  cat(paste(skipped_chrs, collapse=", "), "\n")
+}
+
+# Update to remove chromosomes with insufficient data
+valid_chrs <- names(markers_list)
+cat("\nChromosomes with valid marker data:", paste(valid_chrs, collapse=", "), "\n")
+
+# Filter the probability data to only include chromosomes with sufficient marker data
+# Don't use direct subsetting, which can break attributes
+new_filtered_probs <- vector('list', length(valid_chrs))
+names(new_filtered_probs) <- valid_chrs
+
+for (chr in valid_chrs) {
+  new_filtered_probs[[chr]] <- filtered_CC_diplotype_probs[[chr]]
+}
+
+# Copy over all attributes
+attr(new_filtered_probs, 'crosstype') <- attr(filtered_CC_diplotype_probs, 'crosstype')
+attr(new_filtered_probs, 'is_x_chr') <- attr(filtered_CC_diplotype_probs, 'is_x_chr')[valid_chrs]
+attr(new_filtered_probs, 'alleles') <- attr(filtered_CC_diplotype_probs, 'alleles')
+attr(new_filtered_probs, 'alleleprobs') <- attr(filtered_CC_diplotype_probs, 'alleleprobs')
+class(new_filtered_probs) <- class(filtered_CC_diplotype_probs)
+
+# Replace the original object
+filtered_CC_diplotype_probs <- new_filtered_probs
+
+# Step 3: Format gene positions into qtl2 format
+cat("\nFormatting gene positions...\n")
+genes_list <- list()
+genes_skipped_chrs <- character(0)
+
+for (chr in names(filtered_CC_diplotype_probs)) {
+  # Get the chromosome number without "chr" prefix
+  chr_num <- gsub("^chr", "", chr)
+  
+  # Find genes for this chromosome
+  # Try different formats depending on how chromosome names are stored in genes_with_id
+  gene_chr_formats <- c(
+    chr_num,                # e.g., "1"
+    chr,                    # e.g., "chr1"
+    toupper(chr_num),       # e.g., "X"
+    paste0("chr", toupper(chr_num))  # e.g., "chrX"
+  )
+  
+  genes_found <- FALSE
+  
+  for (gene_chr in gene_chr_formats) {
+    genes_chr <- genes_with_id[genes_with_id$chromosome_name == gene_chr, ]
+    
+    if (nrow(genes_chr) > 0) {
+      cat("Found", nrow(genes_chr), "genes for chromosome", chr, "using format", gene_chr, "\n")
+      
+      # Use midpoint of gene as position
+      gene_pos <- (genes_chr$start_position + genes_chr$end_position) / 2
+      names(gene_pos) <- genes_chr$ensembl_gene_id
+      
+      # Store the genes for this chromosome
+      genes_list[[chr]] <- gene_pos
+      genes_found <- TRUE
+      break
+    }
+  }
+  
+  if (!genes_found) {
+    cat("Warning: No genes found for chromosome", chr, "\n")
+    genes_skipped_chrs <- c(genes_skipped_chrs, chr)
+  }
+}
+
+# Report on chromosomes with no gene data
+if (length(genes_skipped_chrs) > 0) {
+  cat("\nThe following chromosomes were skipped due to missing gene data:\n")
+  cat(paste(genes_skipped_chrs, collapse=", "), "\n")
+}
+
+# Step 4: Check alignment between markers and genes
+cat("\nChecking alignment between markers and genes...\n")
+common_chrs <- intersect(names(markers_list), names(genes_list))
+cat("Common chromosomes for interpolation:", paste(common_chrs, collapse=", "), "\n")
+
+if (length(common_chrs) == 0) {
+  stop("No common chromosomes found between markers and genes!")
+}
+
+# Filter to only common chromosomes
+# Create new lists instead of subsetting the original objects
+new_markers_list <- list()
+new_genes_list <- list()
+probs_list <- list()
+
+for (chr in common_chrs) {
+  new_markers_list[[chr]] <- markers_list[[chr]]
+  new_genes_list[[chr]] <- genes_list[[chr]]
+  probs_list[[chr]] <- filtered_CC_diplotype_probs[[chr]]
+}
+
+# Copy over attributes to probs_list
+attr(probs_list, 'crosstype') <- attr(filtered_CC_diplotype_probs, 'crosstype')
+attr(probs_list, 'is_x_chr') <- attr(filtered_CC_diplotype_probs, 'is_x_chr')[common_chrs]
+attr(probs_list, 'alleles') <- attr(filtered_CC_diplotype_probs, 'alleles')
+attr(probs_list, 'alleleprobs') <- attr(filtered_CC_diplotype_probs, 'alleleprobs')
+class(probs_list) <- class(filtered_CC_diplotype_probs)
+
+# Step 5: Ensure marker alignment for each chromosome
+cat("\nChecking marker alignment for each chromosome...\n")
+for (chr in common_chrs) {
+  prob_markers <- dimnames(probs_list[[chr]])[[3]]
+  marker_pos_markers <- names(new_markers_list[[chr]])
+  
+  if (!identical(prob_markers, marker_pos_markers)) {
+    cat("Aligning markers for chromosome", chr, "\n")
+    
+    # Find the common markers
+    common_markers <- intersect(prob_markers, marker_pos_markers)
+    
+    if (length(common_markers) > 0) {
+      # Keep only common markers in both datasets
+      prob_indices <- match(common_markers, prob_markers)
+      probs_list[[chr]] <- probs_list[[chr]][,,prob_indices, drop=FALSE]
+      
+      # Keep the same markers in marker_pos
+      new_markers_list[[chr]] <- new_markers_list[[chr]][common_markers]
+      
+      cat("  Aligned", length(common_markers), "markers for chromosome", chr, "\n")
+    } else {
+      # If no common markers but markers are the same length, we can try to use position ordering
+      if (length(prob_markers) == length(marker_pos_markers)) {
+        # If same length, just rename the marker positions
+        names(new_markers_list[[chr]]) <- prob_markers
+        cat("  Renamed markers in position list to match probability markers\n")
+      } else {
+        # If different lengths and no common markers, this is problematic
+        cat("Warning: Cannot establish marker correspondence for chromosome", chr, "\n")
+        cat("  Removing chromosome", chr, "from analysis\n")
+        
+        # Remove this chromosome from our lists
+        new_markers_list[[chr]] <- NULL
+        new_genes_list[[chr]] <- NULL
+        probs_list[[chr]] <- NULL
+      }
+    }
+  }
+}
+
+# Update common_chrs after alignment checks
+common_chrs <- intersect(names(new_markers_list), names(new_genes_list))
+cat("\nFinal chromosomes for interpolation after alignment checks:", paste(common_chrs, collapse=", "), "\n")
+
+if (length(common_chrs) == 0) {
+  stop("No common chromosomes left after alignment checks!")
+}
+
+# Double-check marker alignment for all remaining chromosomes
+for (chr in common_chrs) {
+  if (!identical(dimnames(probs_list[[chr]])[[3]], names(new_markers_list[[chr]]))) {
+    stop("Failed to align markers for chromosome ", chr)
+  }
+}
+
+# Step 6: Apply interpolation
+cat("\nPerforming interpolation...\n")
+interpolated_probs <- interpolate_genoprobs(
+  probs1 = probs_list,
+  markers1 = new_markers_list,
+  markers2 = new_genes_list
+)
+
+# Step 7: Convert to a more convenient format for downstream analysis
+cat("\nConverting interpolated probabilities to data frame...\n")
+interpolated_df <- data.frame()
+
+for (chr_name in names(interpolated_probs)) {
+  chr_array <- interpolated_probs[[chr_name]]
+  
+  # Extract dimensions
+  samples <- dimnames(chr_array)[[1]]
+  founders <- dimnames(chr_array)[[2]]
+  genes <- dimnames(chr_array)[[3]]
+  
+  cat("Processing chromosome", chr_name, "with", length(genes), "genes\n")
+  
+  # Create data frame more efficiently with pre-allocation
+  chr_rows <- length(samples) * length(founders) * length(genes)
+  chr_df <- data.frame(
+    sample = character(chr_rows),
+    founder = character(chr_rows),
+    gene = character(chr_rows),
+    chromosome = character(chr_rows),
+    probability = numeric(chr_rows),
+    stringsAsFactors = FALSE
+  )
+  
+  row_idx <- 1
+  for (sample_idx in 1:length(samples)) {
+    sample <- samples[sample_idx]
+    for (founder_idx in 1:length(founders)) {
+      founder <- founders[founder_idx]
+      
+      # Process batches of genes for efficiency
+      batch_size <- 1000
+      for (start_idx in seq(1, length(genes), by = batch_size)) {
+        end_idx <- min(start_idx + batch_size - 1, length(genes))
+        batch_genes <- genes[start_idx:end_idx]
+        batch_size_actual <- length(batch_genes)
+        
+        # Extract batch probabilities
+        batch_probs <- chr_array[sample_idx, founder_idx, batch_genes]
+        
+        # Assign to pre-allocated dataframe
+        batch_indices <- row_idx:(row_idx + batch_size_actual - 1)
+        chr_df$sample[batch_indices] <- sample
+        chr_df$founder[batch_indices] <- founder
+        chr_df$gene[batch_indices] <- batch_genes
+        chr_df$chromosome[batch_indices] <- sub("chr", "", chr_name)
+        chr_df$probability[batch_indices] <- batch_probs
+        
+        row_idx <- row_idx + batch_size_actual
+      }
+    }
+  }
+  
+  # Append to main dataframe
+  interpolated_df <- rbind(interpolated_df, chr_df[1:(row_idx-1),])
+}
+
+# Step 8: Save the interpolated probabilities with timestamp
+cat("\nSaving results...\n")
+save_rds_file <- paste0("Results/Interpolate/CC_gene_interpolated_probs.rds")
+
+# Save both the array and dataframe formats
+saveRDS(interpolated_probs, save_rds_file)
+save_csv_file <- paste0("Results/Interpolate/CC_gene_interpolated_probs.csv")
+data.table::fwrite(interpolated_df, save_csv_file)
+
+cat("Saved interpolated probabilities to", save_rds_file, "\n")
+cat("Saved interpolated probabilities as dataframe to", save_csv_file, "\n")
+
+# Final report
+cat("\nSummary of interpolation:\n")
+cat("- Started with", length(names(filtered_CC_diplotype_probs)), "chromosomes in probability data\n")
+cat("- Found marker data for", length(names(markers_list)), "chromosomes\n")
+cat("- Found gene data for", length(names(genes_list)), "chromosomes\n")
+cat("- Successfully interpolated", length(names(interpolated_probs)), "chromosomes\n")
+
+```
+
+## 5. Compare GBRS-derived CC diplotypes vs "CC_gene_interpolated_probs" – Cosine similarity
+
+```{r}
+################################################################################
+# CC Parental Baseline Cosine Similarity Analysis
+# Analyzes CC parental samples for baseline metrics
+################################################################################
+
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+
+# Fixed cosine similarity function with proper error handling
+cos_sim = function(a, b) {
+  v = rep(1L, ncol(a))
+  numerator <- (a * b) %*% v
+  denominator <- sqrt(a^2 %*% v * b^2 %*% v)
+  
+  # Handle division by zero
+  result <- numerator / denominator
+  
+  # Replace NaN values with 0 (no similarity)
+  result[is.nan(result)] <- 0
+  
+  return(mean(result, na.rm = TRUE))
+}
+
+# Enhanced cosine similarity that also returns similarity per gene
+cos_sim_per_gene = function(a, b) {
+  v = rep(1L, ncol(a))
+  numerator <- (a * b) %*% v
+  denominator <- sqrt(a^2 %*% v * b^2 %*% v)
+  
+  # Handle division by zero
+  gene_sims <- numerator / denominator
+  
+  # Replace NaN values with 0 (no similarity)
+  gene_sims[is.nan(gene_sims)] <- 0
+  
+  return(list(
+    overall_sim = mean(gene_sims, na.rm = TRUE),
+    per_gene_sim = gene_sims
+  ))
+}
+
+# Convert GBRS read counts to allele proportions matrix
+gbrs_to_proportions <- function(gbrs_counts) {
+  # Initialize the proportions matrix
+  prop_matrix <- matrix(0, nrow = nrow(gbrs_counts), ncol = 8)
+  rownames(prop_matrix) <- gbrs_counts$locus
+  colnames(prop_matrix) <- LETTERS[1:8]
+  
+  # Fill in proportions
+  for (i in 1:nrow(gbrs_counts)) {
+    if (!is.na(gbrs_counts$total[i]) && gbrs_counts$total[i] > 0) {
+      prop_matrix[i, ] <- as.numeric(gbrs_counts[i, LETTERS[1:8]]) / gbrs_counts$total[i]
+    }
+  }
+  
+  return(prop_matrix)
+}
+
+# Updated extract_strain_probs function for the specific CC_gene_interpolated_probs structure
+extract_strain_probs <- function(interpolated_probs, strain_name, gene_ids) {
+  # Create matrix for this strain
+  strain_matrix <- matrix(0, nrow = length(gene_ids), ncol = 8)
+  rownames(strain_matrix) <- gene_ids
+  colnames(strain_matrix) <- LETTERS[1:8]
+  
+  # Find the strain's index in each chromosome's data
+  for (chr in names(interpolated_probs)) {
+    # Get strain index (row index) - assuming CC_gene_interpolated_probs structure
+    # where first dimension is strain, with strain names in dimnames[[1]]
+    strain_idx <- which(dimnames(interpolated_probs[[chr]])[[1]] == strain_name)
+    
+    if (length(strain_idx) > 0) {
+      # Get genes for this chromosome
+      chr_genes <- intersect(gene_ids, dimnames(interpolated_probs[[chr]])[[3]])
+      
+      # Extract probabilities for this strain and these genes
+      for (gene in chr_genes) {
+        if (gene %in% dimnames(interpolated_probs[[chr]])[[3]]) {
+          gene_idx <- match(gene, dimnames(interpolated_probs[[chr]])[[3]])
+          # Extract the probability array for this strain and gene
+          strain_matrix[gene, ] <- interpolated_probs[[chr]][strain_idx[1], , gene_idx]
+        }
+      }
+    }
+  }
+  
+  return(strain_matrix)
+}
+
+# Analyze cosine similarity for a single CC parental sample
+analyze_sample_cosine <- function(sample_id, gbrs_base_path, interpolated_probs, strain_id) {
+  # Construct file path for CC parental sample
+  sample_file <- file.path(gbrs_base_path, sample_id, 
+                          paste0(sample_id, "_gbrs.quantified.diploid.genes.expected_read_counts"))
+  
+  # Check if file exists
+  if (!file.exists(sample_file)) {
+    cat("File not found for sample", sample_id, "\n")
+    return(NULL)
+  }
+  
+  # Load GBRS alignment counts
+  gbrs_counts <- tryCatch({
+    read.table(sample_file, header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+  }, error = function(e) {
+    cat("Error reading file for sample", sample_id, ":", e$message, "\n")
+    return(NULL)
+  })
+  
+  if (is.null(gbrs_counts) || nrow(gbrs_counts) == 0) {
+    cat("Empty file for sample", sample_id, "\n")
+    return(NULL)
+  }
+  
+  # Check required columns
+  required_cols <- c("locus", "total", LETTERS[1:8])
+  if (!all(required_cols %in% colnames(gbrs_counts))) {
+    cat("Missing required columns for sample", sample_id, "\n")
+    return(NULL)
+  }
+  
+  # Convert GBRS data to proportions matrix
+  sample_matrix <- gbrs_to_proportions(gbrs_counts)
+  
+  # Get gene IDs to analyze (those in the GBRS file with non-zero totals)
+  valid_genes <- gbrs_counts$locus[!is.na(gbrs_counts$total) & gbrs_counts$total > 0]
+  
+  # Extract strain matrix for the parental strain
+  strain_matrix <- extract_strain_probs(interpolated_probs, strain_id, valid_genes)
+  
+  # Ensure matrices have the same rows (genes)
+  common_genes <- intersect(rownames(sample_matrix), rownames(strain_matrix))
+  
+  if (length(common_genes) == 0) {
+    cat("No common genes found for sample", sample_id, "\n")
+    return(NULL)
+  }
+  
+  # Subset matrices to common genes
+  sample_matrix <- sample_matrix[common_genes, ]
+  strain_matrix <- strain_matrix[common_genes, ]
+  
+  # Remove rows that are all zeros in any matrix
+  non_zero_rows <- rowSums(sample_matrix) > 0 & rowSums(strain_matrix) > 0
+  
+  if (sum(non_zero_rows) == 0) {
+    cat("ERROR: No valid non-zero rows found for comparison\n")
+    return(NULL)
+  }
+  
+  sample_matrix <- sample_matrix[non_zero_rows, ]
+  strain_matrix <- strain_matrix[non_zero_rows, ]
+  
+  # Calculate similarity
+  sim_to_strain <- cos_sim(sample_matrix, strain_matrix)
+  
+  # Calculate per-gene similarities for detailed analysis
+  detailed_sim_strain <- cos_sim_per_gene(sample_matrix, strain_matrix)
+  
+  # Calculate similarity thresholds for the cosine similarity
+  gene_similarities <- data.frame(
+    gene = rownames(sample_matrix),
+    sim_strain = detailed_sim_strain$per_gene_sim,
+    stringsAsFactors = FALSE
+  )
+  
+  # Map genes to chromosomes using the interpolated_probs structure
+  chromosomes <- rep("unknown", length(gene_similarities$gene))
+  names(chromosomes) <- gene_similarities$gene
+  
+  # For each chromosome in the interpolated_probs list
+  for (chr in names(interpolated_probs)) {
+    # Get genes in this chromosome from third dimension of array
+    chr_genes <- dimnames(interpolated_probs[[chr]])[[3]]
+    
+    # Find matching genes between our gene set and this chromosome
+    matching_genes <- intersect(gene_similarities$gene, chr_genes)
+    
+    # Set chromosome for these genes
+    if (length(matching_genes) > 0) {
+      chromosomes[matching_genes] <- paste0("chr", chr)
+    }
+  }
+  
+  # Add chromosome information to the gene_similarities dataframe
+  gene_similarities$chromosome <- chromosomes[gene_similarities$gene]
+  
+  # Calculate per-chromosome similarity
+  chr_similarities <- gene_similarities %>%
+    dplyr::group_by(chromosome) %>%
+    dplyr::summarize(
+      sim_strain = mean(sim_strain, na.rm = TRUE),
+      gene_count = dplyr::n()
+    )
+  
+  # Create final result object
+  result <- list(
+    sample_id = sample_id,
+    strain_id = strain_id,
+    n_genes = nrow(sample_matrix),
+    sim_to_strain = sim_to_strain,
+    
+    # Detailed results for further analysis
+    gene_similarities = gene_similarities,
+    chr_similarities = chr_similarities
+  )
+  
+  return(result)
+}
+
+# Modified function to handle alpha-numeric sample IDs
+analyze_all_parental_samples <- function(sample_list, gbrs_base_path, metadata_subset, 
+                                     interpolated_probs, parental_strains) {
+  results <- list()
+  
+  # Initialize results list for each CC line
+  for (strain in unique(names(parental_strains))) {
+    results[[strain]] <- list()
+  }
+  
+  for (sample_id in sample_list) {
+    # Find this sample in the metadata using exact matching of ID as character
+    # This avoids numeric conversion issues with alpha-numeric IDs
+    sample_row <- which(as.character(metadata_subset$Animal.ID) == sample_id)
+    
+    if (length(sample_row) == 0) {
+      cat("Skipping sample", sample_id, "- not found in metadata\n")
+      next
+    }
+    
+    # Get the cross type from metadata
+    cross_type <- metadata_subset$Cross[sample_row[1]]
+    
+    # Skip if cross type not in parental_strains
+    if (!(cross_type %in% names(parental_strains))) {
+      cat("Skipping sample", sample_id, "- cross type", cross_type, "not defined in parental_strains\n")
+      next
+    }
+    
+    # Get strain ID for this cross
+    strain_id <- parental_strains[[cross_type]]
+    
+    cat("Processing sample", sample_id, "(Cross:", cross_type, ", Strain:", strain_id, ")\n")
+    
+    # Analyze this sample against its parental strain
+    sample_result <- analyze_sample_cosine(sample_id, gbrs_base_path, 
+                                          interpolated_probs, strain_id)
+    
+    if (!is.null(sample_result)) {
+      results[[cross_type]][[sample_id]] <- sample_result
+      cat("Analyzed", sample_result$n_genes, "genes for sample", sample_id, "\n")
+      cat("Cosine similarity to", strain_id, ":", round(sample_result$sim_to_strain, 3), "\n")
+    }
+  }
+  
+  return(results)
+}
+
+# Summarize cosine similarity results for parental samples
+summarize_parental_results <- function(cosine_results, parental_strains) {
+  summary <- list()
+  
+  for (strain_cross in names(cosine_results)) {
+    # Skip if no samples for this strain
+    if (length(cosine_results[[strain_cross]]) == 0) {
+      next
+    }
+    
+    cat("\n=======================================\n")
+    cat("Parental Strain:", strain_cross, "\n")
+    
+    # Get strain ID for this cross
+    strain_id <- parental_strains[[strain_cross]]
+    
+    cat("Strain ID:", strain_id, "\n")
+    
+    # Collect statistics
+    sample_count <- length(cosine_results[[strain_cross]])
+    cat("Number of samples:", sample_count, "\n")
+    
+    # Aggregate results
+    sim_to_strain <- sapply(cosine_results[[strain_cross]], function(x) x$sim_to_strain)
+    genes_analyzed <- sapply(cosine_results[[strain_cross]], function(x) x$n_genes)
+    
+    cat("Total genes analyzed:", sum(genes_analyzed), "\n")
+    cat("Average genes per sample:", round(mean(genes_analyzed)), "\n\n")
+    
+    cat("=== COSINE SIMILARITY METRICS ===\n")
+    cat("Average similarity to", strain_id, ":", round(mean(sim_to_strain), 3), "\n")
+    cat("Min similarity:", round(min(sim_to_strain), 3), "\n")
+    cat("Max similarity:", round(max(sim_to_strain), 3), "\n")
+    cat("Standard deviation:", round(sd(sim_to_strain), 3), "\n\n")
+    
+    # Create data frame for sample-level results
+    sample_df <- do.call(rbind, lapply(names(cosine_results[[strain_cross]]), function(sample) {
+      result <- cosine_results[[strain_cross]][[sample]]
+      df <- data.frame(
+        Sample = sample,
+        Genes = result$n_genes,
+        Sim_To_Strain = round(result$sim_to_strain, 3),
+        stringsAsFactors = FALSE
+      )
+      return(df)
+    }))
+    
+    # Aggregate chromosome-level results
+    chr_df <- do.call(rbind, lapply(names(cosine_results[[strain_cross]]), function(sample) {
+      result <- cosine_results[[strain_cross]][[sample]]
+      if (!is.null(result$chr_similarities)) {
+        df <- result$chr_similarities
+        df$Sample <- sample
+        return(df)
+      } else {
+        return(NULL)
+      }
+    }))
+    
+    # Store summary results
+    summary[[strain_cross]] <- list(
+      strain_cross = strain_cross,
+      strain_id = strain_id,
+      sample_count = sample_count,
+      total_genes = sum(genes_analyzed),
+      avg_genes_per_sample = mean(genes_analyzed),
+      
+      # Cosine similarity metrics
+      avg_sim_to_strain = mean(sim_to_strain),
+      min_sim_to_strain = min(sim_to_strain),
+      max_sim_to_strain = max(sim_to_strain),
+      sd_sim_to_strain = sd(sim_to_strain),
+      
+      # Sample-level results
+      sample_results = sample_df,
+      
+      # Chromosome-level results
+      chr_results = chr_df
+    )
+    
+    # Print sample results
+    cat("\n=== SAMPLE-LEVEL RESULTS ===\n")
+    print(sample_df)
+    
+    # Print chromosome results summary
+    cat("\n=== CHROMOSOME-LEVEL RESULTS ===\n")
+    chr_summary <- chr_df %>%
+      dplyr::group_by(chromosome) %>%
+      dplyr::summarize(
+        avg_sim = mean(sim_strain, na.rm = TRUE),
+        sd_sim = sd(sim_strain, na.rm = TRUE),
+        avg_genes = mean(gene_count, na.rm = TRUE)
+      )
+    print(chr_summary)
+  }
+  
+  return(summary)
+}
+
+# Modified visualization function to include chromosome-level visualization
+create_parental_visualizations <- function(summary, output_base_dir = "Results/CC") {
+  viz_dirs <- list()
+  
+  for (strain_cross in names(summary)) {
+    strain_data <- summary[[strain_cross]]
+    strain_id <- strain_data$strain_id
+    
+    # Extract the CC number from the strain string for cleaner labels
+    strain_label <- sub("/.*", "", strain_id)
+    
+    # Create strain-specific directory structure: Results/CC/[strain]/Cosine
+    strain_dir <- file.path(output_base_dir, strain_cross, "Cosine")
+    if (!dir.exists(strain_dir)) {
+      dir.create(strain_dir, recursive = TRUE)
+    }
+    
+    # Store the visualization directory for this strain
+    viz_dirs[[strain_cross]] <- strain_dir
+    
+    # Create visualizations only if we have sample results
+    if (nrow(strain_data$sample_results) > 0) {
+      # 1. Sample-by-sample bar plot
+      sample_data <- strain_data$sample_results %>%
+        dplyr::mutate(
+          Sample = factor(Sample, levels = Sample[order(Sim_To_Strain, decreasing = TRUE)])
+        )
+      
+      sample_plot <- ggplot(sample_data, aes(x = Sample, y = Sim_To_Strain)) +
+        geom_bar(stat = "identity", fill = "blue", alpha = 0.7) +
+        theme_minimal() +
+        labs(
+          title = paste("Cosine Similarity by Sample -", strain_cross),
+          y = paste("Similarity to", strain_label),
+          x = "Sample ID"
+        ) +
+        geom_hline(yintercept = strain_data$avg_sim_to_strain, 
+                  color = "red", linetype = "dashed") +
+        theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+      
+      # Save the sample plot
+      sample_plot_file <- file.path(strain_dir, paste0(strain_cross, "_sample_similarities.pdf"))
+      ggsave(sample_plot_file, sample_plot, width = 12, height = 6)
+      
+      # 2. Chromosome-level similarity plot
+      if (!is.null(strain_data$chr_results) && nrow(strain_data$chr_results) > 0) {
+        # Aggregate by chromosome
+        chr_summary <- strain_data$chr_results %>%
+          dplyr::group_by(chromosome) %>%
+          dplyr::summarize(
+            avg_sim = mean(sim_strain, na.rm = TRUE),
+            sd_sim = sd(sim_strain, na.rm = TRUE),
+            count = dplyr::n()
+          )
+        
+        # Sort chromosomes to ensure proper ordering (chr1, chr2, ..., chr19, chrX)
+        chr_summary$chromosome <- factor(chr_summary$chromosome, 
+                                        levels = c(paste0("chr", 1:19), "chrX"))
+        
+        chr_summary <- chr_summary %>% arrange(chromosome)
+        
+        # Create chromosome plot
+        chr_plot <- ggplot(chr_summary, aes(x = chromosome, y = avg_sim)) +
+          geom_bar(stat = "identity", fill = "darkgreen", alpha = 0.7) +
+          geom_errorbar(aes(ymin = avg_sim - sd_sim, ymax = avg_sim + sd_sim), width = 0.2) +
+          theme_minimal() +
+          labs(
+            title = paste("Cosine Similarity by Chromosome -", strain_cross),
+            y = paste("Similarity to", strain_label),
+            x = "Chromosome"
+          ) +
+          geom_hline(yintercept = strain_data$avg_sim_to_strain, 
+                    color = "red", linetype = "dashed") +
+          theme(axis.text.x = element_text(angle = 45, hjust = 1))
+        
+        # Save the chromosome plot
+        chr_plot_file <- file.path(strain_dir, paste0(strain_cross, "_chromosome_similarities.pdf"))
+        ggsave(chr_plot_file, chr_plot, width = 10, height = 6)
+      }
+    }
+    
+    cat("Visualizations for strain", strain_cross, "created in directory:", strain_dir, "\n")
+  }
+  
+  # Create a comparison plot if we have multiple strains
+  if (length(summary) > 1) {
+    # Prepare comparison data for chromosome-level comparison across strains
+    chr_comparison_data <- data.frame(
+      Strain = character(),
+      Chromosome = character(),
+      Similarity = numeric(),
+      SD = numeric(),
+      stringsAsFactors = FALSE
+    )
+    
+    for (strain_cross in names(summary)) {
+      strain_data <- summary[[strain_cross]]
+      if (!is.null(strain_data$chr_results) && nrow(strain_data$chr_results) > 0) {
+        # Aggregate chromosome data for this strain
+        chr_summary <- strain_data$chr_results %>%
+          dplyr::group_by(chromosome) %>%
+          dplyr::summarize(
+            avg_sim = mean(sim_strain, na.rm = TRUE),
+            sd_sim = sd(sim_strain, na.rm = TRUE)
+          )
+        
+        temp_df <- data.frame(
+          Strain = rep(strain_cross, nrow(chr_summary)),
+          Chromosome = chr_summary$chromosome,
+          Similarity = chr_summary$avg_sim,
+          SD = chr_summary$sd_sim,
+          stringsAsFactors = FALSE
+        )
+        
+        chr_comparison_data <- rbind(chr_comparison_data, temp_df)
+      }
+    }
+    
+    # Create chromosome comparison plot if we have data
+    if (nrow(chr_comparison_data) > 0) {
+      # Ensure proper chromosome ordering
+      chr_comparison_data$Chromosome <- factor(chr_comparison_data$Chromosome, 
+                                            levels = c(paste0("chr", 1:19), "chrX"))
+      
+      # Create the comparison plot
+      chr_compare_plot <- ggplot(chr_comparison_data, 
+                              aes(x = Chromosome, y = Similarity, fill = Strain)) +
+        geom_bar(stat = "identity", position = "dodge", alpha = 0.7) +
+        geom_errorbar(aes(ymin = Similarity - SD, ymax = Similarity + SD), 
+                     position = position_dodge(width = 0.9), width = 0.2) +
+        theme_minimal() +
+        labs(
+          title = "Chromosome Similarity Comparison Across Strains",
+          y = "Cosine Similarity",
+          x = "Chromosome"
+        ) +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1))
+      
+      # Save the chromosome comparison plot
+      chr_compare_file <- file.path(output_base_dir, "chromosome_strain_comparison.pdf")
+      ggsave(chr_compare_file, chr_compare_plot, width = 12, height = 6)
+      
+      cat("Chromosome comparison plot created at:", chr_compare_file, "\n")
+    }
+  }
+  
+  return(viz_dirs)
+}
+
+#################################################################################
+# EXAMPLE USAGE SCRIPT USING PRELOADED VARIABLES
+#################################################################################
+
+# We assume the following variables are preloaded:
+# - metadata_subset: Contains sample metadata (Animal.ID, Cross, etc.)
+# - CC_gene_interpolated_probs: Contains interpolated probabilities for CC strains
+
+# Define sample list from metadata - ensure they're character strings
+sample_list <- as.character(metadata_subset$Animal.ID)
+
+# Define base path to GBRS data
+gbrs_base_path <- "CC_quantify_ASE"
+
+# Define output directory base
+output_base_dir <- "Results/CC"
+
+# Define parental strains for each CC cross type
+parental_strains <- list(
+  "CC001xCC001" = "CC001/Unc",
+  "CC019xCC019" = "CC019/TauUnc",
+  "CC040xCC040" = "CC040/TauUnc"
+)
+
+# Run the analysis
+results <- analyze_all_parental_samples(
+  sample_list = sample_list,
+  gbrs_base_path = gbrs_base_path,
+  metadata_subset = metadata_subset,
+  interpolated_probs = CC_gene_interpolated_probs,
+  parental_strains = parental_strains
+)
+
+# Summarize results
+summary <- summarize_parental_results(results, parental_strains)
+
+# Create visualizations - saves to Results/CC/[strain]/Cosine
+viz_dirs <- create_parental_visualizations(summary, output_base_dir)
+
+# Generate summary reports for each strain
+for (strain_cross in names(summary)) {
+  # Create strain-specific directory for output
+  strain_cosine_dir <- file.path(output_base_dir, strain_cross, "Cosine")
+  if (!dir.exists(strain_cosine_dir)) {
+    dir.create(strain_cosine_dir, recursive = TRUE)
+  }
+  
+  # Generate report for this strain
+  strain_data <- summary[[strain_cross]]
+  report_file <- file.path(strain_cosine_dir, paste0(strain_cross, "_cosine_analysis_report.txt"))
+  
+  sink(report_file)
+  cat("CC Parental Baseline Cosine Similarity Analysis for", strain_cross, "\n")
+  cat(paste(rep("=", 50), collapse = ""), "\n\n")
+  cat("Analysis Date:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n")
+  
+  # Write strain-specific information
+  cat("\nCC Strain Cross:", strain_cross, "\n")
+  cat("Reference Strain ID:", strain_data$strain_id, "\n")
+  cat("Number of Samples:", strain_data$sample_count, "\n")
+  cat("Total Genes Analyzed:", strain_data$total_genes, "\n")
+  cat("Average Genes per Sample:", round(strain_data$avg_genes_per_sample), "\n\n")
+  
+  cat("COSINE SIMILARITY METRICS:\n")
+  cat("Average similarity to reference strain:", round(strain_data$avg_sim_to_strain, 3), "\n")
+  cat("Minimum similarity:", round(strain_data$min_sim_to_strain, 3), "\n")
+  cat("Maximum similarity:", round(strain_data$max_sim_to_strain, 3), "\n")
+  cat("Standard deviation:", round(strain_data$sd_sim_to_strain, 3), "\n\n")
+  
+  # Print sample-level results
+  cat("SAMPLE-LEVEL RESULTS:\n")
+  print(strain_data$sample_results)
+  
+  # Add chromosome-level results to the report
+  if (!is.null(strain_data$chr_results) && nrow(strain_data$chr_results) > 0) {
+    cat("\nCHROMOSOME-LEVEL RESULTS:\n")
+    chr_summary <- strain_data$chr_results %>%
+      group_by(chromosome) %>%
+      summarize(
+        avg_sim = mean(sim_strain, na.rm = TRUE),
+        sd_sim = sd(sim_strain, na.rm = TRUE),
+        avg_genes = mean(gene_count, na.rm = TRUE)
+      )
+    print(chr_summary)
+  }
+  
+  sink()
+  
+  cat("Report for strain", strain_cross, "generated at", report_file, "\n")
+  
+  # Also save the summary as an RDS file
+  summary_file <- file.path(strain_cosine_dir, paste0(strain_cross, "_cosine_summary.rds"))
+  saveRDS(strain_data, summary_file)
+  
+  # Save the raw results for this strain as well
+  if (strain_cross %in% names(results)) {
+    raw_results_file <- file.path(strain_cosine_dir, paste0(strain_cross, "_cosine_raw_results.rds"))
+    saveRDS(results[[strain_cross]], raw_results_file)
+  }
+}
+
+# Create overall summary file
+overall_summary_file <- file.path(output_base_dir, "cc_parental_baseline_summary.txt")
+sink(overall_summary_file)
+cat("CC Parental Baseline Cosine Similarity Summary\n")
+cat("============================================\n\n")
+cat("Analysis Date:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n\n")
+
+# Create a comparison table
+comparison_table <- data.frame(
+  CC_Strain = character(),
+  Avg_Similarity = numeric(),
+  Min_Similarity = numeric(),
+  Max_Similarity = numeric(),
+  SD_Similarity = numeric(),
+  Sample_Count = integer(),
+  stringsAsFactors = FALSE
+)
+
+for (strain_cross in names(summary)) {
+  strain_data <- summary[[strain_cross]]
+  strain_label <- sub("/.*", "", strain_data$strain_id)
+  
+  comparison_table <- rbind(comparison_table, data.frame(
+    CC_Strain = strain_cross,
+    Avg_Similarity = round(strain_data$avg_sim_to_strain, 3),
+    Min_Similarity = round(strain_data$min_sim_to_strain, 3),
+    Max_Similarity = round(strain_data$max_sim_to_strain, 3),
+    SD_Similarity = round(strain_data$sd_sim_to_strain, 3),
+    Sample_Count = strain_data$sample_count,
+    stringsAsFactors = FALSE
+  ))
+}
+
+cat("COMPARISON OF PARENTAL STRAINS:\n")
+print(comparison_table)
+sink()
+
+cat("Overall summary generated at", overall_summary_file, "\n")
+
+# Save overall results as RDS for future reference
+
+
+# CC001: 0.947
+# CC019: 0.909
+# CC040: 0.934
+```
+
+## 6. Generate CCRIX combined parental diplotype matrices
+
+```{r}
+# Updated function to generate sex-specific combined matrices for RIX combinations
+generate_rix_combined_matrices_by_sex <- function(interpolated_probs, output_dir = "Results/Combined_Matrices_By_Sex") {
+  # Make sure output directory exists
+  if (!dir.exists(output_dir)) {
+    dir.create(output_dir, recursive = TRUE)
+  }
+  
+  # Define the RIX combinations
+  rix_combinations <- list(
+    "RIX1" = c("CC001/Unc", "CC019/TauUnc"),
+    "RIX2" = c("CC019/TauUnc", "CC040/TauUnc"),
+    "RIX3" = c("CC001/Unc", "CC040/TauUnc")
+  )
+  
+  # Function to create combined matrix for a chromosome, taking sex into account
+  create_combined_chromosome <- function(chromosome_data, parent1_idx, parent2_idx, is_female, is_x_chr) {
+    # Get the number of genes in this chromosome
+    n_genes <- dim(chromosome_data)[3]
+    
+    # Create a matrix to store the combined probabilities
+    combined_matrix <- array(0, dim = c(1, dim(chromosome_data)[2], n_genes))
+    
+    # Name the dimensions appropriately
+    dimnames(combined_matrix) <- list(
+      "Combined",
+      dimnames(chromosome_data)[[2]], 
+      dimnames(chromosome_data)[[3]]
+    )
+    
+    # For each gene, combine parent probabilities based on sex and chromosome
+    for (gene_idx in 1:n_genes) {
+      parent1_probs <- chromosome_data[parent1_idx, , gene_idx]
+      parent2_probs <- chromosome_data[parent2_idx, , gene_idx]
+      
+      # For X chromosome in males, only use maternal X
+      if (!is_female && is_x_chr) {
+        # For males, X chromosome is only from the mother (parent1 in forward cross)
+        combined_matrix[1, , gene_idx] <- parent1_probs
+      } else {
+        # For autosomes (both sexes) and X in females, average both parents
+        combined_matrix[1, , gene_idx] <- (parent1_probs + parent2_probs) / 2
+      }
+    }
+    
+    return(combined_matrix)
+  }
+  
+  # Process each RIX combination for both forward and reverse crosses (to account for sex differences)
+  for (rix_name in names(rix_combinations)) {
+    # Forward cross (parent1 = female, parent2 = male)
+    cat("Processing", rix_name, "Forward Cross...\n")
+    
+    parent1 <- rix_combinations[[rix_name]][1]  # mother
+    parent2 <- rix_combinations[[rix_name]][2]  # father
+    
+    # Process both sexes for forward cross
+    for (sex in c("Female", "Male")) {
+      is_female <- sex == "Female"
+      cross_direction <- "Forward"
+      
+      cat("  Creating", sex, "matrix for", cross_direction, "cross:", parent1, "(♀) ×", parent2, "(♂)\n")
+      
+      # Create a new interpolated_probs structure for the combined data
+      combined_probs <- list()
+      
+      # Process each chromosome
+      for (chr in names(interpolated_probs)) {
+        cat("    Processing chromosome", chr, "\n")
+        
+        # Determine if this is X chromosome
+        is_x_chr <- chr == "X" || chr == "chrX"
+        
+        # Find parent indices in this chromosome
+        parent1_idx <- which(rownames(interpolated_probs[[chr]]) == parent1)
+        parent2_idx <- which(rownames(interpolated_probs[[chr]]) == parent2)
+        
+        if (length(parent1_idx) == 0 || length(parent2_idx) == 0) {
+          cat("    Warning: Could not find both parents in chromosome", chr, "\n")
+          next
+        }
+        
+        # Create combined matrix for this chromosome, accounting for sex and X chromosome
+        combined_probs[[chr]] <- create_combined_chromosome(
+          interpolated_probs[[chr]], parent1_idx, parent2_idx, is_female, is_x_chr
+        )
+      }
+      
+      # Save the combined matrix
+      output_file <- file.path(output_dir, paste0(rix_name, "_", cross_direction, "_", sex, "_combined_matrix.rds"))
+      saveRDS(combined_probs, output_file)
+      cat("  Saved combined matrix to", output_file, "\n")
+    }
+    
+    # Reverse cross (parent2 = female, parent1 = male)
+    cat("Processing", rix_name, "Reverse Cross...\n")
+    
+    parent1 <- rix_combinations[[rix_name]][2]  # mother in reverse cross
+    parent2 <- rix_combinations[[rix_name]][1]  # father in reverse cross
+    
+    # Process both sexes for reverse cross
+    for (sex in c("Female", "Male")) {
+      is_female <- sex == "Female"
+      cross_direction <- "Reverse"
+      
+      cat("  Creating", sex, "matrix for", cross_direction, "cross:", parent1, "(♀) ×", parent2, "(♂)\n")
+      
+      # Create a new interpolated_probs structure for the combined data
+      combined_probs <- list()
+      
+      # Process each chromosome
+      for (chr in names(interpolated_probs)) {
+        cat("    Processing chromosome", chr, "\n")
+        
+        # Determine if this is X chromosome
+        is_x_chr <- chr == "X" || chr == "chrX"
+        
+        # Find parent indices in this chromosome
+        parent1_idx <- which(rownames(interpolated_probs[[chr]]) == parent1)
+        parent2_idx <- which(rownames(interpolated_probs[[chr]]) == parent2)
+        
+        if (length(parent1_idx) == 0 || length(parent2_idx) == 0) {
+          cat("    Warning: Could not find both parents in chromosome", chr, "\n")
+          next
+        }
+        
+        # Create combined matrix for this chromosome, accounting for sex and X chromosome
+        combined_probs[[chr]] <- create_combined_chromosome(
+          interpolated_probs[[chr]], parent1_idx, parent2_idx, is_female, is_x_chr
+        )
+      }
+      
+      # Save the combined matrix
+      output_file <- file.path(output_dir, paste0(rix_name, "_", cross_direction, "_", sex, "_combined_matrix.rds"))
+      saveRDS(combined_probs, output_file)
+      cat("  Saved combined matrix to", output_file, "\n")
+    }
+  }
+  
+  cat("All RIX combined matrices generated successfully.\n")
+  return(output_dir)
+}
+
+# Example usage:
+
+```
+
+## 7. Compare GBRS-derived CCRIX diplotypes vs "Combined matrices by Sex" from CC_gene_interpolated_probs – Cosine similarity
+
+```{r}
+# RIX1 01x19 
+# CC_qunatify_ASE = 0.688
+# DO.G10 = 0.890
+# DO.G9 = 0.890 
+# DO.G8 = 0.890
+# DO.G0 = 0.891 !! 
+# DO.G100 = 0.889 
+
+# RIX2 19x40
+# DO.G10 = 0.889
+# DO.G0 = 0.889 
+# DO.G100 = 0.887 
+
+# RIX3 01x40
+# DO.G10 = 0.906 
+# DO.G0 = 0.907 ! 
+# DO.G100 = 0.904 
+
+# Best values
+# 01x19: 0.891
+# 19x40: 0.889
+# 01x40: 0.907
+
+# It appears these DO.trabsprob files truly dont have a big influence on the diplotype calls -- appears G0 is the best option (by a margin of 0.001)
+```
+
+```{r}
+################################################################################
+# CCRIX Cosine Similarity Analysis - Using Combined Parental Matrices
+# Simplified version - Removed sex comparisons, added single cross capability
+################################################################################
+
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+
+# ============================================================================
+# SPECIFY YOUR INPUT FILES AND PARAMETERS HERE
+# ============================================================================
+
+# Input file paths - EDIT THESE PATHS to point to your data
+metadata_file <- metadata_subset
+
+ccrix_base_path <- "quantify_ASE_G0" 
+
+interpolated_probs_file <- CC_gene_interpolated_probs 
+
+combined_matrices_dir <- "Results/Combined_Matrices_By_Sex"  
+
+# Output settings
+output_base_dir <- "Results/CCRIX_G0"
+
+# Optional: Specify a single cross to analyze (e.g., "CC001xCC019")
+# Set to NULL to analyze all crosses in the metadata
+target_cross <- NULL
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+# Fixed cosine similarity function with proper error handling
+cos_sim = function(a, b) {
+  v = rep(1L, ncol(a))
+  numerator <- (a * b) %*% v
+  denominator <- sqrt(a^2 %*% v * b^2 %*% v)
+  
+  # Handle division by zero
+  result <- numerator / denominator
+  
+  # Replace NaN values with 0 (no similarity)
+  result[is.nan(result)] <- 0
+  
+  return(mean(result, na.rm = TRUE))
+}
+
+# Enhanced cosine similarity that also returns similarity per gene
+cos_sim_per_gene = function(a, b) {
+  v = rep(1L, ncol(a))
+  numerator <- (a * b) %*% v
+  denominator <- sqrt(a^2 %*% v * b^2 %*% v)
+  
+  # Handle division by zero
+  gene_sims <- numerator / denominator
+  
+  # Replace NaN values with 0 (no similarity)
+  gene_sims[is.nan(gene_sims)] <- 0
+  
+  return(list(
+    overall_sim = mean(gene_sims, na.rm = TRUE),
+    per_gene_sim = gene_sims
+  ))
+}
+
+# Convert CCRIX read counts to allele proportions matrix
+ccrix_to_proportions <- function(ccrix_counts) {
+  # Initialize the proportions matrix
+  prop_matrix <- matrix(0, nrow = nrow(ccrix_counts), ncol = 8)
+  rownames(prop_matrix) <- ccrix_counts$locus
+  colnames(prop_matrix) <- LETTERS[1:8]
+  
+  # Fill in proportions
+  for (i in 1:nrow(ccrix_counts)) {
+    if (!is.na(ccrix_counts$total[i]) && ccrix_counts$total[i] > 0) {
+      prop_matrix[i, ] <- as.numeric(ccrix_counts[i, LETTERS[1:8]]) / ccrix_counts$total[i]
+    }
+  }
+  
+  return(prop_matrix)
+}
+
+# Extract probability matrices for a strain across all chromosomes
+extract_strain_probs <- function(interpolated_probs, strain_name, gene_ids) {
+  # Create matrix for this strain
+  strain_matrix <- matrix(0, nrow = length(gene_ids), ncol = 8)
+  rownames(strain_matrix) <- gene_ids
+  
+  # Find the strain's index in each chromosome's data
+  for (chr in names(interpolated_probs)) {
+    # Try exact match
+    strain_idx <- which(dimnames(interpolated_probs[[chr]])[[1]] == strain_name)
+    
+    if (length(strain_idx) > 0) {
+      # Get genes for this chromosome
+      chr_genes <- intersect(gene_ids, dimnames(interpolated_probs[[chr]])[[3]])
+      
+      # Extract probabilities for this strain and these genes
+      for (gene in chr_genes) {
+        if (gene %in% dimnames(interpolated_probs[[chr]])[[3]]) {
+          gene_idx <- match(gene, dimnames(interpolated_probs[[chr]])[[3]])
+          strain_matrix[gene, ] <- interpolated_probs[[chr]][strain_idx[1], , gene_idx]
+        }
+      }
+    }
+  }
+  
+  return(strain_matrix)
+}
+
+# Extract probability matrix from combined parental matrix
+extract_combined_probs <- function(combined_matrix, gene_ids) {
+  # Create matrix for the combined reference
+  combined_strain_matrix <- matrix(0, nrow = length(gene_ids), ncol = 8)
+  rownames(combined_strain_matrix) <- gene_ids
+  
+  # Extract probabilities from the combined matrix
+  for (chr in names(combined_matrix)) {
+    # Get genes for this chromosome
+    chr_genes <- intersect(gene_ids, dimnames(combined_matrix[[chr]])[[3]])
+    
+    # Extract probabilities for these genes
+    for (gene in chr_genes) {
+      if (gene %in% dimnames(combined_matrix[[chr]])[[3]]) {
+        gene_idx <- match(gene, dimnames(combined_matrix[[chr]])[[3]])
+        # Combined matrix has only one row ("Combined")
+        combined_strain_matrix[gene, ] <- combined_matrix[[chr]][1, , gene_idx]
+      }
+    }
+  }
+  
+  return(combined_strain_matrix)
+}
+
+# Modified CCRIX sample analysis using only combined parental matrix
+analyze_sample_cosine <- function(sample_id, ccrix_base_path, interpolated_probs, 
+                                combined_matrix, parent1, parent2) {
+  # Construct file path
+  sample_file <- file.path(ccrix_base_path, sample_id, 
+                          paste0(sample_id, "_gbrs.quantified.diploid.genes.expected_read_counts"))
+  
+  # Check if file exists
+  if (!file.exists(sample_file)) {
+    cat("File not found for sample", sample_id, "\n")
+    return(NULL)
+  }
+  
+  # Load CCRIX alignment counts
+  ccrix_counts <- tryCatch({
+    read.table(sample_file, header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+  }, error = function(e) {
+    cat("Error reading file for sample", sample_id, ":", e$message, "\n")
+    return(NULL)
+  })
+  
+  if (is.null(ccrix_counts) || nrow(ccrix_counts) == 0) {
+    cat("Empty file for sample", sample_id, "\n")
+    return(NULL)
+  }
+  
+  # Check required columns
+  required_cols <- c("locus", "total", LETTERS[1:8])
+  if (!all(required_cols %in% colnames(ccrix_counts))) {
+    cat("Missing required columns for sample", sample_id, "\n")
+    return(NULL)
+  }
+  
+  # Convert CCRIX data to proportions matrix
+  ccrix_matrix <- ccrix_to_proportions(ccrix_counts)
+  
+  # Get gene IDs to analyze (those in the CCRIX file with non-zero totals)
+  valid_genes <- ccrix_counts$locus[!is.na(ccrix_counts$total) & ccrix_counts$total > 0]
+  
+  # Extract combined matrix for these genes
+  combined_parent_matrix <- extract_combined_probs(combined_matrix, valid_genes)
+  
+  # Ensure all matrices have the same rows (genes)
+  common_genes <- intersect(rownames(ccrix_matrix), rownames(combined_parent_matrix))
+  
+  if (length(common_genes) == 0) {
+    cat("No common genes found for sample", sample_id, "\n")
+    return(NULL)
+  }
+  
+  # Add diagnostic info
+  cat("Sample", sample_id, "has", length(common_genes), "common genes\n")
+  
+  # Subset matrices to common genes
+  ccrix_matrix <- ccrix_matrix[common_genes, ]
+  combined_parent_matrix <- combined_parent_matrix[common_genes, ]
+  
+  # Remove rows that are all zeros in the ccrix matrix or combined matrix
+  non_zero_rows <- rowSums(ccrix_matrix) > 0 & rowSums(combined_parent_matrix) > 0
+  
+  cat("Sample", sample_id, "has", sum(non_zero_rows), "non-zero rows out of", length(non_zero_rows), "\n")
+  
+  if (sum(non_zero_rows) == 0) {
+    cat("ERROR: No valid non-zero rows found for comparison\n")
+    return(NULL)
+  }
+  
+  ccrix_matrix <- ccrix_matrix[non_zero_rows, ]
+  combined_parent_matrix <- combined_parent_matrix[non_zero_rows, ]
+  
+  # Calculate similarity to combined matrix
+  sim_to_combined <- cos_sim(ccrix_matrix, combined_parent_matrix)
+  
+  # For completeness, we'll still extract parent matrices and calculate similarities
+  # (even though we don't need to display them)
+  valid_genes_filtered <- rownames(ccrix_matrix)
+  parent1_matrix <- extract_strain_probs(interpolated_probs, parent1, valid_genes_filtered)
+  parent2_matrix <- extract_strain_probs(interpolated_probs, parent2, valid_genes_filtered)
+  
+  # Calculate similarity to individual parents
+  sim_to_parent1 <- cos_sim(ccrix_matrix, parent1_matrix)
+  sim_to_parent2 <- cos_sim(ccrix_matrix, parent2_matrix)
+  
+  # Calculate similarity between parents (as reference)
+  parent1_parent2_sim <- cos_sim(parent1_matrix, parent2_matrix)
+  
+  # Calculate similarity of combined matrix to each parent
+  combined_to_parent1 <- cos_sim(combined_parent_matrix, parent1_matrix)
+  combined_to_parent2 <- cos_sim(combined_parent_matrix, parent2_matrix)
+  
+  # Calculate per-gene similarities for detailed analysis
+  detailed_sim_parent1 <- cos_sim_per_gene(ccrix_matrix, parent1_matrix)
+  detailed_sim_parent2 <- cos_sim_per_gene(ccrix_matrix, parent2_matrix)
+  detailed_sim_combined <- cos_sim_per_gene(ccrix_matrix, combined_parent_matrix)
+  
+  # Calculate gene-level similarities
+  gene_similarities <- data.frame(
+    gene = rownames(ccrix_matrix),
+    sim_parent1 = detailed_sim_parent1$per_gene_sim,
+    sim_parent2 = detailed_sim_parent2$per_gene_sim,
+    sim_combined = detailed_sim_combined$per_gene_sim,
+    stringsAsFactors = FALSE
+  )
+  
+  # Map genes to chromosomes
+  chromosomes <- rep("unknown", length(gene_similarities$gene))
+  names(chromosomes) <- gene_similarities$gene
+  
+  # For each chromosome in the interpolated_probs list
+  for (chr in names(interpolated_probs)) {
+    # Get genes in this chromosome from third dimension of array
+    chr_genes <- dimnames(interpolated_probs[[chr]])[[3]]
+    
+    # Find matching genes between our gene set and this chromosome
+    matching_genes <- intersect(gene_similarities$gene, chr_genes)
+    
+    # Set chromosome for these genes
+    if (length(matching_genes) > 0) {
+      chromosomes[matching_genes] <- paste0("chr", chr)
+    }
+  }
+  
+  # Add chromosome information to the gene_similarities dataframe
+  gene_similarities$chromosome <- chromosomes[gene_similarities$gene]
+  
+  # Calculate per-chromosome similarity
+  chr_similarities <- gene_similarities %>%
+    dplyr::group_by(chromosome) %>%
+    dplyr::summarize(
+      sim_combined = mean(sim_combined, na.rm = TRUE),
+      sim_parent1 = mean(sim_parent1, na.rm = TRUE),
+      sim_parent2 = mean(sim_parent2, na.rm = TRUE),
+      gene_count = dplyr::n()
+    )
+  
+  # Create final result object
+  result <- list(
+    sample_id = sample_id,
+    n_genes = nrow(ccrix_matrix),
+    sim_to_parent1 = sim_to_parent1,
+    sim_to_parent2 = sim_to_parent2,
+    sim_to_combined = sim_to_combined,
+    parent1_parent2_sim = parent1_parent2_sim,
+    combined_to_parent1 = combined_to_parent1,
+    combined_to_parent2 = combined_to_parent2,
+    
+    # Detailed results for further analysis
+    gene_similarities = gene_similarities,
+    chr_similarities = chr_similarities
+  )
+  
+  return(result)
+}
+
+# Modified summarize function with simplified reporting
+summarize_cosine_results <- function(cosine_results, parent_strains) {
+  summary <- list()
+  
+  for (cross_type in names(cosine_results)) {
+    # Skip if no samples for this cross
+    if (length(cosine_results[[cross_type]]) == 0) {
+      next
+    }
+    
+    cat("\n=======================================\n")
+    cat("Cross:", cross_type, "\n")
+    
+    # Get parents for this cross
+    parents <- parent_strains[[cross_type]]
+    parent1 <- parents[1]
+    parent2 <- parents[2]
+    
+    cat("Parental strains:", paste(parents, collapse = " x "), "\n")
+    
+    # Collect statistics
+    sample_count <- length(cosine_results[[cross_type]])
+    cat("Total number of samples:", sample_count, "\n")
+    
+    # Group samples by sex for separate M/F summaries
+    samples_by_sex <- list(
+      "Female" = names(cosine_results[[cross_type]])[sapply(cosine_results[[cross_type]], function(x) x$sex == "Female")],
+      "Male" = names(cosine_results[[cross_type]])[sapply(cosine_results[[cross_type]], function(x) x$sex == "Male")]
+    )
+    
+    cat("Female samples:", length(samples_by_sex$Female), "\n")
+    cat("Male samples:", length(samples_by_sex$Male), "\n\n")
+    
+    # Combine all samples for cross-level results
+    all_samples_df <- do.call(rbind, lapply(names(cosine_results[[cross_type]]), function(sample) {
+      result <- cosine_results[[cross_type]][[sample]]
+      df <- data.frame(
+        Sample = sample,
+        Sex = result$sex,
+        RIX = result$rix,
+        Direction = result$cross_direction,
+        Matrix = result$matrix_key,
+        Genes = result$n_genes,
+        Sim_Combined = round(result$sim_to_combined, 3),
+        Sim_Parent1 = round(result$sim_to_parent1, 3),
+        Sim_Parent2 = round(result$sim_to_parent2, 3),
+        stringsAsFactors = FALSE
+      )
+      return(df)
+    }))
+    
+    # Cross-level summary
+    cat("=== OVERALL CROSS SUMMARY ===\n")
+    
+    # Aggregate results for all samples
+    sim_to_parent1 <- sapply(cosine_results[[cross_type]], function(x) x$sim_to_parent1)
+    sim_to_parent2 <- sapply(cosine_results[[cross_type]], function(x) x$sim_to_parent2)
+    sim_to_combined <- sapply(cosine_results[[cross_type]], function(x) x$sim_to_combined)
+    
+    # Get parent-parent and combined-parent similarities
+    parent1_parent2_sim <- mean(sapply(cosine_results[[cross_type]], function(x) x$parent1_parent2_sim))
+    combined_to_parent1 <- mean(sapply(cosine_results[[cross_type]], function(x) x$combined_to_parent1))
+    combined_to_parent2 <- mean(sapply(cosine_results[[cross_type]], function(x) x$combined_to_parent2))
+    
+    genes_analyzed <- sapply(cosine_results[[cross_type]], function(x) x$n_genes)
+    
+    cat("Total genes analyzed:", sum(genes_analyzed), "\n")
+    cat("Average genes per sample:", round(mean(genes_analyzed)), "\n\n")
+    
+    cat("COSINE SIMILARITY METRICS:\n")
+    cat("Average similarity to combined reference:", round(mean(sim_to_combined), 3), "\n")
+    cat("Average similarity to", parent1, ":", round(mean(sim_to_parent1), 3), "\n")
+    cat("Average similarity to", parent2, ":", round(mean(sim_to_parent2), 3), "\n")
+    
+    cat("Similarity between", parent1, "and", parent2, ":", round(parent1_parent2_sim, 3), "\n")
+    cat("Similarity of combined matrix to", parent1, ":", round(combined_to_parent1, 3), "\n")
+    cat("Similarity of combined matrix to", parent2, ":", round(combined_to_parent2, 3), "\n\n")
+    
+    # Collect chromosome-level summaries
+    all_chr_df <- do.call(rbind, lapply(names(cosine_results[[cross_type]]), function(sample) {
+      result <- cosine_results[[cross_type]][[sample]]
+      if (!is.null(result$chr_similarities)) {
+        df <- result$chr_similarities
+        df$Sample <- sample
+        return(df)
+      } else {
+        return(NULL)
+      }
+    }))
+    
+    # Aggregate chromosome-level results
+    if (!is.null(all_chr_df) && nrow(all_chr_df) > 0) {
+      chr_summary <- all_chr_df %>%
+        dplyr::group_by(chromosome) %>%
+        dplyr::summarize(
+          avg_sim_combined = mean(sim_combined, na.rm = TRUE),
+          sd_sim_combined = sd(sim_combined, na.rm = TRUE),
+          avg_genes = mean(gene_count, na.rm = TRUE)
+        )
+      
+      cat("\n=== CHROMOSOME-LEVEL RESULTS ===\n")
+      print(chr_summary)
+    }
+    
+    # Store full summary for this cross
+    summary[[cross_type]] <- list(
+      cross = cross_type,
+      parents = parents,
+      sample_count = sample_count,
+      all_samples = all_samples_df,
+      chromosome_summary = chr_summary,
+      
+      # Cross-level metrics
+      avg_sim_combined = mean(sim_to_combined),
+      avg_sim_parent1 = mean(sim_to_parent1),
+      avg_sim_parent2 = mean(sim_to_parent2),
+      parent1_parent2_sim = parent1_parent2_sim,
+      combined_to_parent1 = combined_to_parent1,
+      combined_to_parent2 = combined_to_parent2,
+      total_genes = sum(genes_analyzed),
+      avg_genes_per_sample = mean(genes_analyzed)
+    )
+  }
+  
+  return(summary)
+}
+
+# Modified visualization function to focus only on combined reference and add chromosome similarity
+create_visualizations <- function(summary, output_base_dir = "Results/CCRIX") {
+  viz_dirs <- list()
+  
+  for (cross_type in names(summary)) {
+    cross_data <- summary[[cross_type]]
+    parents <- cross_data$parents
+    parent1 <- parents[1]
+    parent2 <- parents[2]
+    
+    # Extract the CC number from the parent string for cleaner labels
+    parent1_label <- sub("/.*", "", parent1)
+    parent2_label <- sub("/.*", "", parent2)
+    
+    # Create cross-specific directory structure
+    cross_dir <- file.path(output_base_dir, cross_type, "Cosine")
+    if (!dir.exists(cross_dir)) {
+      dir.create(cross_dir, recursive = TRUE)
+    }
+    
+    # Store the visualization directory for this cross
+    viz_dirs[[cross_type]] <- cross_dir
+    
+    # Create visualizations for all samples
+    if (nrow(cross_data$all_samples) > 0) {
+      plot_data <- cross_data$all_samples
+      
+      # 1. Sample-by-sample plot showing ONLY combined reference
+      sample_data <- plot_data %>%
+        dplyr::select(Sample, Sim_Combined) %>%
+        dplyr::mutate(
+          Sample = factor(Sample, levels = Sample[order(Sim_Combined, decreasing = TRUE)])
+        )
+      
+      sample_plot_sim <- ggplot(sample_data, aes(x = Sample, y = Sim_Combined)) +
+        geom_bar(stat = "identity", fill = "green", alpha = 0.7) +
+        theme_minimal() +
+        labs(
+          title = paste("Cosine Similarity to Combined Reference -", cross_type),
+          y = "Cosine Similarity",
+          x = "Sample ID"
+        ) +
+        geom_hline(yintercept = cross_data$avg_sim_combined, 
+                   color = "red", linetype = "dashed") +
+        theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+      
+      # Save the sample similarity plot
+      sample_sim_file <- file.path(cross_dir, paste0(cross_type, "_sample_similarity.pdf"))
+      ggsave(sample_sim_file, sample_plot_sim, width = 12, height = 6)
+      
+      # 2. Chromosome-level similarity plot
+      if (!is.null(cross_data$chromosome_summary) && nrow(cross_data$chromosome_summary) > 0) {
+        chr_summary <- cross_data$chromosome_summary
+        
+        # Sort chromosomes to ensure proper ordering (chr1, chr2, ..., chr19, chrX)
+        chr_summary$chromosome <- factor(chr_summary$chromosome, 
+                                        levels = c(paste0("chr", 1:19), "chrX"))
+        
+        chr_summary <- chr_summary %>% dplyr::arrange(chromosome)
+        
+        # Create chromosome plot
+        chr_plot <- ggplot(chr_summary, aes(x = chromosome, y = avg_sim_combined)) +
+          geom_bar(stat = "identity", fill = "darkgreen", alpha = 0.7) +
+          geom_errorbar(aes(ymin = avg_sim_combined - sd_sim_combined, 
+                           ymax = avg_sim_combined + sd_sim_combined), width = 0.2) +
+          theme_minimal() +
+          labs(
+            title = paste("Cosine Similarity by Chromosome -", cross_type),
+            y = "Similarity to Combined Reference",
+            x = "Chromosome"
+          ) +
+          geom_hline(yintercept = cross_data$avg_sim_combined, 
+                    color = "red", linetype = "dashed") +
+          theme(axis.text.x = element_text(angle = 45, hjust = 1))
+        
+        # Save the chromosome plot
+        chr_plot_file <- file.path(cross_dir, paste0(cross_type, "_chromosome_similarities.pdf"))
+        ggsave(chr_plot_file, chr_plot, width = 10, height = 6)
+      }
+    }
+    
+    cat("Visualizations for cross", cross_type, "created in directory:", cross_dir, "\n")
+  }
+  
+  return(viz_dirs)
+}
+
+# Add this new function to create the cross-to-RIX mapping
+create_cross_to_rix_mapping <- function() {
+  # Define the mapping between cross types and RIX
+  cross_to_rix <- list()
+  
+  # RIX1 includes CC001xCC019 and CC019xCC001
+  cross_to_rix[["CC001xCC019"]] <- list(rix = "RIX1", direction = "Forward")
+  cross_to_rix[["CC019xCC001"]] <- list(rix = "RIX1", direction = "Reverse")
+  
+  # RIX2 includes CC019xCC040 and CC040xCC019
+  cross_to_rix[["CC019xCC040"]] <- list(rix = "RIX2", direction = "Forward")
+  cross_to_rix[["CC040xCC019"]] <- list(rix = "RIX2", direction = "Reverse")
+  
+  # RIX3 includes CC001xCC040 and CC040xCC001
+  cross_to_rix[["CC001xCC040"]] <- list(rix = "RIX3", direction = "Forward")
+  cross_to_rix[["CC040xCC001"]] <- list(rix = "RIX3", direction = "Reverse")
+  
+  return(cross_to_rix)
+}
+
+# ============================================================================
+# FUNCTION TO LOAD COMBINED MATRICES
+# ============================================================================
+
+load_combined_matrices <- function(combined_matrices_dir) {
+  if (!dir.exists(combined_matrices_dir)) {
+    stop("Combined matrices directory not found: ", combined_matrices_dir)
+  }
+  
+  # List all RDS files in the directory
+  matrix_files <- list.files(combined_matrices_dir, pattern = ".*_combined_matrix\\.rds$", full.names = TRUE)
+  
+  if (length(matrix_files) == 0) {
+    stop("No combined matrix files found in directory: ", combined_matrices_dir)
+  }
+  
+  cat("Found", length(matrix_files), "combined matrix files\n")
+  
+  # Load all matrices into a named list
+  combined_matrices <- list()
+  for (file_path in matrix_files) {
+    # Extract the key (RIX_Direction_Sex) from the filename
+    filename <- basename(file_path)
+    key <- sub("_combined_matrix\\.rds$", "", filename)
+    
+    cat("Loading matrix:", key, "\n")
+    
+    # Load the matrix
+    matrix_data <- readRDS(file_path)
+    combined_matrices[[key]] <- matrix_data
+  }
+  
+  return(combined_matrices)
+}
+
+# ============================================================================
+# ANALYZE SAMPLES FUNCTION
+# ============================================================================
+
+# Function to analyze all samples using the combined matrices
+
+analyze_samples_cosine <- function(
+  sample_list,
+  ccrix_base_path,
+  metadata_subset,
+  interpolated_probs,
+  combined_matrices,
+  parent_strains,
+  cross_to_rix,
+  target_cross = NULL
+) {
+  results <- list()
+  
+  # Initialize results list for each cross type
+  for (cross_type in names(parent_strains)) {
+    results[[cross_type]] <- list()
+  }
+  
+  # Process each sample
+  for (sample_id in sample_list) {
+    # Find this sample in the metadata
+    sample_row <- which(as.character(metadata_subset$Animal.ID) == sample_id)
+    
+    if (length(sample_row) == 0) {
+      cat("Skipping sample", sample_id, "- not found in metadata\n")
+      next
+    }
+    
+    # Get cross type and sex from metadata
+    cross_type <- metadata_subset$Cross[sample_row[1]]
+    sex <- metadata_subset$Sex[sample_row[1]]
+    
+    # Skip if targeting a specific cross and this isn't it
+    if (!is.null(target_cross) && target_cross != "" && cross_type != target_cross) {
+      next
+    }
+    
+    # Skip if cross type not in parent_strains
+    if (!(cross_type %in% names(parent_strains))) {
+      cat("Skipping sample", sample_id, "- cross type", cross_type, "not defined in parent_strains\n")
+      next
+    }
+    
+    # Get parent strains for this cross
+    parents <- parent_strains[[cross_type]]
+    parent1 <- parents[1]
+    parent2 <- parents[2]
+    
+    # Get RIX and direction information
+    rix_info <- cross_to_rix[[cross_type]]
+    rix <- rix_info$rix
+    direction <- rix_info$direction
+    
+    # Determine which combined matrix to use
+    # Convert sex to proper case format (first letter uppercase, rest lowercase)
+    formatted_sex <- paste0(toupper(substr(sex, 1, 1)), tolower(substr(sex, 2, nchar(sex))))
+    matrix_key <- paste(rix, direction, formatted_sex, sep = "_")
+    
+    # Check if we have a combined matrix for this combination
+    if (!(matrix_key %in% names(combined_matrices))) {
+      cat("WARNING: No combined matrix found for", matrix_key, "\n")
+      cat("Available matrices:", paste(names(combined_matrices), collapse = ", "), "\n")
+      cat("Trying case-insensitive match...\n")
+      
+      # Try case-insensitive match
+      matrix_names_lower <- tolower(names(combined_matrices))
+      matrix_key_lower <- tolower(matrix_key)
+      match_idx <- which(matrix_names_lower == matrix_key_lower)
+      
+      if (length(match_idx) > 0) {
+        matrix_key <- names(combined_matrices)[match_idx[1]]
+        cat("Found case-insensitive match:", matrix_key, "\n")
+      } else {
+        cat("Trying to find a matrix for just", rix, "and", direction, "...\n")
+        
+        # Try to find any matrix for this RIX and direction
+        possible_keys <- grep(paste0("^", rix, "_", direction), names(combined_matrices), value = TRUE)
+        
+        if (length(possible_keys) > 0) {
+          matrix_key <- possible_keys[1]
+          cat("Using matrix:", matrix_key, "\n")
+        } else {
+          cat("ERROR: No suitable matrix found for", sample_id, "\n")
+          next
+        }
+      }
+    }
+    
+    cat("Processing sample", sample_id, "(Cross:", cross_type, ", Sex:", sex, ", RIX:", rix, ", Direction:", direction, ")\n")
+    
+    # Get the combined matrix for this sample
+    combined_matrix <- combined_matrices[[matrix_key]]
+    
+    # Analyze this sample against the combined matrix
+    sample_result <- analyze_sample_cosine(
+      sample_id = sample_id,
+      ccrix_base_path = ccrix_base_path,
+      interpolated_probs = interpolated_probs,
+      combined_matrix = combined_matrix,
+      parent1 = parent1,
+      parent2 = parent2
+    )
+    
+    if (!is.null(sample_result)) {
+      # Add metadata to the result
+      sample_result$sex <- sex
+      sample_result$rix <- rix
+      sample_result$cross_direction <- direction
+      sample_result$matrix_key <- matrix_key
+      
+      # Store the result
+      results[[cross_type]][[sample_id]] <- sample_result
+      
+      cat("Analyzed", sample_result$n_genes, "genes for sample", sample_id, "\n")
+      cat("Cosine similarity to combined reference:", round(sample_result$sim_to_combined, 3), "\n")
+    }
+  }
+  
+  return(results)
+}
+
+# ============================================================================
+# ANALYZE CHROMOSOME SIMILARITIES FUNCTION
+# ============================================================================
+
+analyze_chromosome_similarities <- function(results, summary, output_base_dir) {
+  for (cross_type in names(results)) {
+    cross_samples <- results[[cross_type]]
+    
+    if (length(cross_samples) == 0) {
+      next
+    }
+    
+    # Create cross-specific directory structure
+    cross_dir <- file.path(output_base_dir, cross_type, "Cosine")
+    if (!dir.exists(cross_dir)) {
+      dir.create(cross_dir, recursive = TRUE)
+    }
+    
+    # Extract chromosome data from all samples
+    all_chr_data <- do.call(rbind, lapply(names(cross_samples), function(sample_id) {
+      sample_result <- cross_samples[[sample_id]]
+      
+      if (!is.null(sample_result$chr_similarities)) {
+        chr_data <- sample_result$chr_similarities
+        chr_data$sample_id <- sample_id
+        return(chr_data)
+      } else {
+        return(NULL)
+      }
+    }))
+    
+    if (!is.null(all_chr_data) && nrow(all_chr_data) > 0) {
+      # Summarize by chromosome
+      chr_summary <- all_chr_data %>%
+        dplyr::group_by(chromosome) %>%
+        dplyr::summarize(
+          avg_sim_combined = mean(sim_combined, na.rm = TRUE),
+          sd_sim_combined = sd(sim_combined, na.rm = TRUE),
+          avg_gene_count = mean(gene_count, na.rm = TRUE),
+          sample_count = dplyr::n_distinct(sample_id)
+        )
+      
+      # Save chromosome summary
+      chr_summary_file <- file.path(cross_dir, paste0(cross_type, "_chromosome_summary.csv"))
+      write.csv(chr_summary, chr_summary_file, row.names = FALSE)
+      
+      cat("Chromosome similarity summary for", cross_type, "saved to", chr_summary_file, "\n")
+    } else {
+      cat("No chromosome similarity data available for", cross_type, "\n")
+    }
+  }
+}
+
+# ============================================================================
+# RUN CCRIX ANALYSIS FUNCTION
+# ============================================================================
+
+run_ccrix_analysis <- function(
+  metadata_file,                 # Metadata file path or object
+  ccrix_base_path,               # Base path to CCRIX data
+  interpolated_probs_file,       # RDS file with interpolated probabilities  
+  combined_matrices_dir,         # Directory with combined matrices
+  output_base_dir = "Results/CCRIX_Analysis",  # Output directory
+  target_cross = NULL            # Optional: Specific cross to analyze
+) {
+  cat("Loading required data files...\n")
+  
+  # 1. Load metadata if it's a file path, or use as is if it's already loaded
+  if (is.character(metadata_file) && file.exists(metadata_file)) {
+    metadata <- read.csv(metadata_file, stringsAsFactors = FALSE)
+  } else if (is.character(metadata_file)) {
+    stop("Metadata file not found: ", metadata_file)
+  } else {
+    # Assume it's already loaded as a data frame
+    metadata <- metadata_file
+  }
+  
+  # Check metadata has required columns
+  required_cols <- c("Animal.ID", "Cross", "Sex")
+  missing_cols <- setdiff(required_cols, colnames(metadata))
+  if (length(missing_cols) > 0) {
+    stop("Metadata is missing required columns: ", paste(missing_cols, collapse = ", "))
+  }
+  
+  # 2. Load interpolated probabilities
+  if (is.character(interpolated_probs_file) && file.exists(interpolated_probs_file)) {
+    interpolated_probs <- readRDS(interpolated_probs_file)
+  } else if (is.character(interpolated_probs_file) && file.exists(paste0(interpolated_probs_file, ".rds"))) {
+    interpolated_probs <- readRDS(paste0(interpolated_probs_file, ".rds"))
+  } else if (is.character(interpolated_probs_file)) {
+    # Check if it's an object in the environment
+    if (exists(interpolated_probs_file)) {
+      interpolated_probs <- get(interpolated_probs_file)
+    } else {
+      stop("Interpolated probabilities file not found: ", interpolated_probs_file)
+    }
+  } else {
+    # Assume it's already loaded
+    interpolated_probs <- interpolated_probs_file
+  }
+  
+  # 3. Load combined matrices from directory
+  combined_matrices <- load_combined_matrices(combined_matrices_dir)
+  
+  # 4. Verify the CCRIX base path exists
+  if (!dir.exists(ccrix_base_path)) {
+    stop("CCRIX base path not found: ", ccrix_base_path)
+  }
+  
+  # 5. Create parent_strains and cross_to_rix mappings from metadata
+  
+  # Get unique crosses
+  crosses <- unique(metadata$Cross)
+  
+  # For each cross, extract parent strains from the cross name
+  parent_strains <- lapply(crosses, function(cross) {
+    parts <- strsplit(cross, "x")[[1]]
+    if (length(parts) != 2) {
+      warning("Invalid cross format: ", cross, ". Expected format: CCXXXxCCYYY")
+      return(NULL)
+    }
+    return(parts)
+  })
+  names(parent_strains) <- crosses
+  
+  # Remove any NULL entries (invalid crosses)
+  parent_strains <- parent_strains[!sapply(parent_strains, is.null)]
+  
+  # Use predefined cross_to_rix mapping instead of creating dynamically
+  cross_to_rix <- create_cross_to_rix_mapping()
+  
+  # Check if the requested cross is in our mapping
+  if (!is.null(target_cross) && !(target_cross %in% names(cross_to_rix))) {
+    stop("Target cross not found in cross_to_rix mapping: ", target_cross)
+  }
+  
+  # 6. Generate sample list from metadata
+  sample_list <- as.character(metadata$Animal.ID)
+  
+  # 7. Filter metadata if target_cross is specified
+  if (!is.null(target_cross) && target_cross != "") {
+    if (!(target_cross %in% crosses)) {
+      stop("Target cross not found in metadata: ", target_cross)
+    }
+    
+    metadata_subset <- metadata[metadata$Cross == target_cross, ]
+    cat("Analyzing only cross:", target_cross, "\n")
+    cat("Found", nrow(metadata_subset), "samples for this cross\n")
+  } else {
+    metadata_subset <- metadata
+    cat("Analyzing all crosses in metadata\n")
+    cat("Total samples:", nrow(metadata_subset), "\n")
+  }
+  
+  # Create output directory if it doesn't exist
+  if (!dir.exists(output_base_dir)) {
+    dir.create(output_base_dir, recursive = TRUE)
+    cat("Created output directory:", output_base_dir, "\n")
+  }
+  
+  # Print summary of what we're going to analyze
+  cat("\n==================================================\n")
+  cat("CCRIX Analysis Configuration:\n")
+  cat("==================================================\n")
+  cat("CCRIX data path:", ccrix_base_path, "\n")
+  cat("Output directory:", output_base_dir, "\n")
+  if (!is.null(target_cross) && target_cross != "") {
+    cat("Target cross:", target_cross, "\n")
+  } else {
+    cat("Crosses to analyze:", paste(names(parent_strains), collapse = ", "), "\n")
+  }
+  cat("Total samples:", length(sample_list), "\n")
+  cat("==================================================\n\n")
+  
+  # 8. Run the analysis
+  cat("Starting CCRIX analysis...\n")
+  
+  # Run the analysis
+  results <- analyze_samples_cosine(
+    sample_list = sample_list,
+    ccrix_base_path = ccrix_base_path,
+    metadata_subset = metadata_subset,
+    interpolated_probs = interpolated_probs,
+    combined_matrices = combined_matrices,
+    parent_strains = parent_strains,
+    cross_to_rix = cross_to_rix,
+    target_cross = target_cross
+  )
+  
+  # No results generated
+  if (length(results) == 0) {
+    cat("No results generated. Check your parameters and data.\n")
+    return(NULL)
+  }
+  
+  # Summarize results
+  cat("\nSummarizing results...\n")
+  summary <- summarize_cosine_results(results, parent_strains)
+  
+  # Create visualizations
+  cat("\nCreating visualizations...\n")
+  viz_dirs <- create_visualizations(summary, output_base_dir)
+  
+  # Analyze chromosome-specific similarities
+  cat("\nAnalyzing chromosome-specific similarities...\n")
+  analyze_chromosome_similarities(results, summary, output_base_dir)
+  
+  # Generate reports
+  cat("\nGenerating reports...\n")
+  generate_reports(summary, output_base_dir)
+  
+  # Save overall results
+  if (!is.null(target_cross) && target_cross != "") {
+    # When targeting a specific cross, only save results for that cross
+    saveRDS(summary, file.path(output_base_dir, paste0(target_cross, "_ccrix_analysis_summary.rds")))
+    saveRDS(results, file.path(output_base_dir, paste0(target_cross, "_ccrix_analysis_results.rds")))
+    
+    # Only save raw results for the target cross
+    if (target_cross %in% names(results)) {
+      cross_dir <- file.path(output_base_dir, target_cross, "Cosine")
+      if (!dir.exists(cross_dir)) {
+        dir.create(cross_dir, recursive = TRUE)
+      }
+      raw_results_file <- file.path(cross_dir, paste0(target_cross, "_cosine_raw_results.rds"))
+      saveRDS(results[[target_cross]], raw_results_file)
+      cat("Saved raw results for cross", target_cross, "to", raw_results_file, "\n")
+    }
+  } else {
+    # When analyzing all crosses, save everything
+    saveRDS(summary, file.path(output_base_dir, "ccrix_analysis_summary.rds"))
+    saveRDS(results, file.path(output_base_dir, "ccrix_analysis_results.rds"))
+    
+    # Save cross-specific raw results files
+    for (cross_type in names(results)) {
+      # Only save non-empty results
+      if (length(results[[cross_type]]) > 0) {
+        cross_dir <- file.path(output_base_dir, cross_type, "Cosine")
+        if (!dir.exists(cross_dir)) {
+          dir.create(cross_dir, recursive = TRUE)
+        }
+        raw_results_file <- file.path(cross_dir, paste0(cross_type, "_cosine_raw_results.rds"))
+        saveRDS(results[[cross_type]], raw_results_file)
+        cat("Saved raw results for cross", cross_type, "to", raw_results_file, "\n")
+      }
+    }
+  }
+  
+  # Final message
+  cat("\n==================================================\n")
+  if (!is.null(target_cross) && target_cross != "") {
+    cat("Analysis for cross", target_cross, "completed successfully!\n")
+  } else {
+    cat("Analysis for all crosses completed successfully!\n")
+  }
+  cat("Output files are in:", output_base_dir, "\n")
+  cat("==================================================\n")
+  
+  return(list(results = results, summary = summary))
+}
+
+
+# ============================================================================
+# PART 3: RUN THE ANALYSIS
+# ============================================================================
+
+# First, define the generate_reports function
+generate_reports <- function(summary, output_base_dir) {
+  # Generate summary reports for each cross
+  for (cross_type in names(summary)) {
+    # Create cross-specific directory for output
+    cross_dir <- file.path(output_base_dir, cross_type, "Cosine")
+    if (!dir.exists(cross_dir)) {
+      dir.create(cross_dir, recursive = TRUE)
+    }
+    
+    # Generate report for this cross
+    cross_data <- summary[[cross_type]]
+    report_file <- file.path(cross_dir, paste0(cross_type, "_cosine_analysis_report.txt"))
+    
+    sink(report_file)
+    cat("CCRIX Cosine Similarity Analysis for", cross_type, "\n")
+    cat(paste(rep("=", 50), collapse = ""), "\n\n")
+    cat("Analysis Date:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n")
+    
+    # Write cross-specific information
+    cat("\nCross Type:", cross_type, "\n")
+    cat("Parent Strains:", paste(cross_data$parents, collapse = " x "), "\n")
+    cat("Number of Samples:", cross_data$sample_count, "\n")
+    cat("Total Genes Analyzed:", cross_data$total_genes, "\n")
+    cat("Average Genes per Sample:", round(cross_data$avg_genes_per_sample), "\n\n")
+    
+    cat("COSINE SIMILARITY METRICS:\n")
+    cat("Average similarity to combined reference:", round(cross_data$avg_sim_combined, 3), "\n")
+    
+    # Print sample-level results
+    cat("\nSAMPLE-LEVEL RESULTS:\n")
+    print(cross_data$all_samples[, c("Sample", "Sex", "Genes", "Sim_Combined")])
+    
+    # Print chromosome-level results if available
+    if (!is.null(cross_data$chromosome_summary)) {
+      cat("\nCHROMOSOME-LEVEL RESULTS:\n")
+      print(cross_data$chromosome_summary)
+    }
+    
+    sink()
+    
+    cat("Report for cross", cross_type, "generated at", report_file, "\n")
+    
+    # Also save the summary as an RDS file
+    summary_file <- file.path(cross_dir, paste0(cross_type, "_cosine_summary.rds"))
+    saveRDS(cross_data, summary_file)
+  }
+  
+  # Create overall summary file
+  overall_summary_file <- file.path(output_base_dir, "ccrix_cosine_summary.txt")
+  sink(overall_summary_file)
+  cat("CCRIX Cosine Similarity Summary\n")
+  cat("============================================\n\n")
+  cat("Analysis Date:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n\n")
+  
+  # Create a comparison table
+  comparison_table <- data.frame(
+    Cross = character(),
+    Parents = character(),
+    Samples = integer(),
+    Avg_Similarity = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  for (cross_type in names(summary)) {
+    cross_data <- summary[[cross_type]]
+    
+    comparison_table <- rbind(comparison_table, data.frame(
+      Cross = cross_type,
+      Parents = paste(cross_data$parents, collapse = " x "),
+      Samples = cross_data$sample_count,
+      Avg_Similarity = round(cross_data$avg_sim_combined, 3),
+      stringsAsFactors = FALSE
+    ))
+  }
+  
+  cat("COMPARISON OF CROSSES:\n")
+  print(comparison_table)
+  sink()
+  
+  cat("Overall summary generated at", overall_summary_file, "\n")
+}
+
+# Run the analysis with the parameters defined at the top of the script
+analysis_results <- run_ccrix_analysis(
+  metadata_file = metadata_file,
+  ccrix_base_path = ccrix_base_path,
+  interpolated_probs_file = interpolated_probs_file,
+  combined_matrices_dir = combined_matrices_dir,
+  output_base_dir = output_base_dir,
+  target_cross = target_cross
+)
+
+# Print completion message
+cat("\nAnalysis completed successfully. Results are stored in:", output_base_dir, "\n")
+```
+
+## 8. Determine/visualize discordant genes
+
+```{r}
+# ============================================================================
+# Discordant Gene Analysis for CCRIX Data
+# ============================================================================
+
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(gridExtra)
+
+# ============================================================================
+# CONFIGURATION - MODIFY THESE PARAMETERS
+# ============================================================================
+
+# Base directory where CCRIX analysis results are stored
+results_base_dir <- "Results/CCRIX_G0"
+
+genes_with_id_path <- NULL  # Set to NULL if genes_with_id is already in the environment
+
+# Similarity threshold below which a gene is considered discordant
+similarity_threshold <- 0.7
+
+# Output directory for discordant gene analysis
+output_base_dir <- "Results/CCRIX_G0_Discordant"
+
+# Optional: Specify a single cross to analyze (e.g., "CC001xCC019")
+# Set to NULL to analyze all crosses
+target_cross <- NULL
+
+# Bin size for chromosome position binning (in Mb)
+bin_size_mb <- 5
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+# Function to load gene coordinates if not already in environment
+load_gene_coordinates <- function(genes_with_id_path) {
+  if (!is.null(genes_with_id_path) && file.exists(genes_with_id_path)) {
+    return(readRDS(genes_with_id_path))
+  } else if (exists("genes_with_id")) {
+    return(get("genes_with_id"))
+  } else {
+    stop("Gene coordinates not found. Please provide a valid path or ensure 'genes_with_id' is loaded.")
+  }
+}
+
+# Function to load CCRIX analysis results
+load_ccrix_results <- function(results_base_dir, target_cross = NULL) {
+  # If target_cross is specified, load only that cross's results
+  if (!is.null(target_cross)) {
+    # Look directly in the cross-specific directory
+    cross_dir <- file.path(results_base_dir, target_cross, "Cosine")
+    results_file <- file.path(cross_dir, paste0(target_cross, "_cosine_raw_results.rds"))
+    
+    if (file.exists(results_file)) {
+      cat("Loading results for cross", target_cross, "from", results_file, "\n")
+      results <- list()
+      results[[target_cross]] <- readRDS(results_file)
+      return(results)
+    } else {
+      stop("Results file not found for cross: ", target_cross, " at path: ", results_file)
+    }
+  } else {
+    # Load all crosses
+    results <- list()
+    cross_dirs <- list.dirs(results_base_dir, full.names = FALSE, recursive = FALSE)
+    
+    for (cross in cross_dirs) {
+      if (grepl("^CC\\d+xCC\\d+$", cross)) {  # Only process directories that look like crosses
+        cross_file <- file.path(results_base_dir, cross, "Cosine", paste0(cross, "_cosine_raw_results.rds"))
+        if (file.exists(cross_file)) {
+          cat("Loading results for cross", cross, "from", cross_file, "\n")
+          results[[cross]] <- readRDS(cross_file)
+        }
+      }
+    }
+    
+    if (length(results) > 0) {
+      return(results)
+    } else {
+      stop("No CCRIX analysis results found in:", results_base_dir)
+    }
+  }
+}
+
+# Function to identify discordant genes for a sample
+identify_sample_discordant_genes <- function(sample_result, similarity_threshold) {
+  if (is.null(sample_result) || is.null(sample_result$gene_similarities)) {
+    return(NULL)
+  }
+  
+  # Get gene similarities
+  gene_data <- sample_result$gene_similarities
+  
+  # Identify discordant genes (those with similarity below threshold)
+  discordant_genes <- gene_data %>%
+    dplyr::filter(sim_combined < similarity_threshold) %>%
+    dplyr::mutate(
+      sample_id = sample_result$sample_id
+    )
+  
+  return(discordant_genes)
+}
+
+# Function to merge discordant genes with genomic coordinates
+merge_discordant_with_coordinates <- function(discordant_genes, gene_coords) {
+  # Standardize gene identifiers
+  gene_coords$gene_id <- gene_coords$ensembl_gene_id
+  
+  # For each gene in discordant_genes, find its coordinates
+  merged_data <- discordant_genes %>%
+    dplyr::left_join(
+      gene_coords %>% 
+        dplyr::select(gene_id, chromosome_name, start_position, end_position),
+      by = c("gene" = "gene_id")
+    )
+  
+  # Calculate gene midpoint position in Mb
+  merged_data <- merged_data %>%
+    dplyr::mutate(
+      midpoint_mb = (start_position + end_position) / 2000000,  # Convert to Mb
+      chromosome_name = as.character(chromosome_name)
+    )
+  
+  return(merged_data)
+}
+
+# Modified function to calculate concordance percentage by bin
+bin_chromosome_positions <- function(merged_data, all_genes_by_chr, bin_size_mb = 5) {
+  # First, identify unique discordant genes and their positions
+  unique_discordant_genes <- merged_data %>%
+    dplyr::select(gene, chromosome_name, midpoint_mb) %>%
+    dplyr::distinct()
+  
+  # Create bins for all chromosomes present in the data
+  chromosomes <- unique(unique_discordant_genes$chromosome_name)
+  
+  # Create a list to store results for each chromosome
+  binned_results <- list()
+  
+  for (chr in chromosomes) {
+    # Get all genes for this chromosome from the reference
+    chr_all_genes <- all_genes_by_chr[[chr]]
+    if (is.null(chr_all_genes) || length(chr_all_genes) == 0) {
+      next
+    }
+    
+    # Get discordant genes for this chromosome
+    chr_discordant_genes <- unique_discordant_genes %>%
+      dplyr::filter(chromosome_name == chr)
+    
+    # Calculate min and max positions based on all genes in the chromosome
+    min_pos <- floor(min(chr_all_genes$midpoint_mb) / bin_size_mb) * bin_size_mb
+    max_pos <- ceiling(max(chr_all_genes$midpoint_mb) / bin_size_mb) * bin_size_mb
+    
+    # Create bins from min to max position
+    bins <- seq(min_pos, max_pos, by = bin_size_mb)
+    
+    # Initialize bin data
+    bin_data <- data.frame(
+      chromosome_name = chr,
+      position_bin = bins,
+      position_bin_label = paste0(bins, "-", bins + bin_size_mb),
+      total_gene_count = 0,
+      discordant_count = 0,
+      pct_concordance = 0
+    )
+    
+    # Count total genes in each bin
+    for (i in 1:length(bins)) {
+      bin_start <- bins[i]
+      bin_end <- bin_start + bin_size_mb
+      
+      # Count all genes in this bin
+      bin_data$total_gene_count[i] <- sum(
+        chr_all_genes$midpoint_mb >= bin_start & 
+        chr_all_genes$midpoint_mb < bin_end
+      )
+      
+      # Count discordant genes in this bin
+      bin_data$discordant_count[i] <- sum(
+        chr_discordant_genes$midpoint_mb >= bin_start & 
+        chr_discordant_genes$midpoint_mb < bin_end
+      )
+    }
+    
+    # Calculate concordance percentage (avoiding division by zero)
+    bin_data <- bin_data %>%
+      dplyr::mutate(
+        pct_concordance = ifelse(
+          total_gene_count > 0,
+          100 * (1 - (discordant_count / total_gene_count)),
+          NA
+        )
+      )
+    
+    # Store results for this chromosome
+    binned_results[[chr]] <- bin_data
+  }
+  
+  # Combine all chromosome results
+  binned_data <- do.call(rbind, binned_results)
+  
+  return(binned_data)
+}
+
+# Function to create chromosome position plots with concordance percentage
+create_chromosome_concordance_plot <- function(binned_data, chromosome, title = NULL) {
+  # Filter data for the specified chromosome
+  chr_data <- binned_data %>%
+    dplyr::filter(chromosome_name == chromosome) %>%
+    dplyr::filter(!is.na(pct_concordance))  # Remove bins with no genes
+  
+  # If no data for this chromosome, return NULL
+  if (nrow(chr_data) == 0) {
+    return(NULL)
+  }
+  
+  # Create plot
+  plot_title <- ifelse(
+    is.null(title),
+    paste0("Gene Concordance Distribution - Chromosome ", chromosome),
+    title
+  )
+  
+  p <- ggplot(chr_data, aes(x = position_bin, y = pct_concordance)) +
+    geom_line(color = "blue", size = 1) +
+    geom_point(size = 2, color = "blue") +
+    ylim(0, 100) +
+    labs(
+      title = plot_title,
+      x = "Chromosome Position (Mb)",
+      y = "% Concordance"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold")
+    )
+  
+  return(p)
+}
+
+# Function to analyze discordant genes across all chromosomes
+analyze_all_chromosomes <- function(cross_data, gene_coords, similarity_threshold, bin_size_mb,
+                                   output_dir) {
+  # Create list to store all discordant genes
+  all_discordant <- list()
+  
+  # Process each sample
+  for (sample_id in names(cross_data)) {
+    cat("Processing sample:", sample_id, "\n")
+    sample_result <- cross_data[[sample_id]]
+    
+    # Identify discordant genes
+    discordant_genes <- identify_sample_discordant_genes(sample_result, similarity_threshold)
+    
+    if (!is.null(discordant_genes) && nrow(discordant_genes) > 0) {
+      all_discordant[[sample_id]] <- discordant_genes
+    }
+  }
+  
+  # Combine all discordant genes
+  if (length(all_discordant) == 0) {
+    cat("No discordant genes found for any sample.\n")
+    return(NULL)
+  }
+  
+  combined_discordant <- do.call(rbind, all_discordant)
+  
+  # Merge with genomic coordinates
+  merged_data <- merge_discordant_with_coordinates(combined_discordant, gene_coords)
+  
+  # Save the complete merged data
+  full_data_file <- file.path(output_dir, "all_discordant_genes_with_coords.csv")
+  write.csv(merged_data, full_data_file, row.names = FALSE)
+  cat("Saved all discordant genes with coordinates to:", full_data_file, "\n")
+  
+  # Filter out entries with missing chromosomes or positions
+  valid_data <- merged_data %>% 
+    dplyr::filter(!is.na(chromosome_name) & !is.na(midpoint_mb))
+  
+  if (nrow(valid_data) == 0) {
+    cat("No valid chromosome coordinate data found for discordant genes.\n")
+    return(NULL)
+  }
+  
+  # Prepare all genes with chromosome positions (for denominator in concordance calculation)
+  all_genes_by_chr <- gene_coords %>%
+    dplyr::mutate(
+      midpoint_mb = (start_position + end_position) / 2000000,  # Convert to Mb
+      chromosome_name = as.character(chromosome_name)
+    ) %>%
+    split(.$chromosome_name)
+  
+  # Count unique discordant genes by chromosome
+  chr_summary <- valid_data %>%
+    dplyr::group_by(chromosome_name, gene) %>%
+    dplyr::summarize(
+      sample_count = n_distinct(sample_id),
+      .groups = "drop"
+    ) %>%
+    dplyr::group_by(chromosome_name) %>%
+    dplyr::summarize(
+      discordant_count = n(),  # Count unique genes, not sample×gene combinations
+      avg_sample_count = mean(sample_count, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    dplyr::arrange(chromosome_name)
+  
+  # Save chromosome summary
+  chr_summary_file <- file.path(output_dir, "chromosome_discordance_summary.csv")
+  write.csv(chr_summary, chr_summary_file, row.names = FALSE)
+  cat("Saved chromosome discordance summary to:", chr_summary_file, "\n")
+  
+  # Create binned data for visualization with concordance percentage
+  binned_data <- bin_chromosome_positions(valid_data, all_genes_by_chr, bin_size_mb)
+  
+  # Save binned data
+  binned_data_file <- file.path(output_dir, "binned_concordance_data.csv")
+  write.csv(binned_data, binned_data_file, row.names = FALSE)
+  
+  # Create individual chromosome plots
+  chromosomes <- unique(valid_data$chromosome_name)
+  chromosomes <- sort(chromosomes)  # Sort chromosomes
+  
+  # Create a directory for chromosome plots
+  chr_plots_dir <- file.path(output_dir, "Chromosome_Plots")
+  if (!dir.exists(chr_plots_dir)) {
+    dir.create(chr_plots_dir, recursive = TRUE)
+  }
+  
+  # Generate individual chromosome plots
+  plot_list <- list()
+  
+  for (chr in chromosomes) {
+    cat("Creating concordance plot for chromosome:", chr, "\n")
+    
+    # Make plot
+    chr_plot <- create_chromosome_concordance_plot(binned_data, chr)
+    
+    if (!is.null(chr_plot)) {
+      plot_list[[chr]] <- chr_plot
+      
+      # Save individual plot as JPEG instead of PDF
+      plot_file <- file.path(chr_plots_dir, paste0("concordance_chr", chr, ".jpg"))
+      ggsave(plot_file, chr_plot, width = 10, height = 6, device = "jpeg", dpi = 300)
+    }
+  }
+  
+  # Create genome-wide summary plot (all chromosomes)
+  combined_plot_file <- file.path(output_dir, "genome_wide_concordance.jpg")
+  
+  if (length(plot_list) > 0) {
+    # Arrange multiple plots in a grid
+    n_plots <- length(plot_list)
+    n_cols <- min(3, n_plots)
+    n_rows <- ceiling(n_plots / n_cols)
+    
+    combined_plot <- gridExtra::grid.arrange(
+      grobs = plot_list,
+      ncol = n_cols,
+      nrow = n_rows,
+      top = "Genome-Wide Gene Concordance Distribution"
+    )
+    
+    # Save the combined plot as JPEG
+    ggsave(combined_plot_file, combined_plot, width = 18, height = 12, device = "jpeg", dpi = 300)
+    cat("Saved genome-wide concordance plot to:", combined_plot_file, "\n")
+  } else {
+    cat("No chromosome plots were generated.\n")
+  }
+  
+  # Create summary visualizations
+  
+  # 1. Chromosome bar plot - showing unique gene counts
+  chr_summary_plot <- ggplot(chr_summary, aes(x = reorder(chromosome_name, discordant_count), 
+                                             y = discordant_count)) +
+    geom_bar(stat = "identity", fill = "darkred", alpha = 0.7) +
+    geom_text(aes(label = discordant_count), vjust = -0.3) +
+    labs(
+      title = "Discordant Genes by Chromosome",
+      x = "Chromosome",
+      y = "Number of Unique Discordant Genes"
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      plot.title = element_text(hjust = 0.5, face = "bold")
+    )
+  
+  # Save chromosome summary plot as JPEG
+  chr_summary_plot_file <- file.path(output_dir, "discordant_genes_by_chromosome.jpg")
+  ggsave(chr_summary_plot_file, chr_summary_plot, width = 12, height = 8, device = "jpeg", dpi = 300)
+  cat("Saved discordant genes by chromosome plot to:", chr_summary_plot_file, "\n")
+  
+  # 2. Calculate percentage of genes in each sample that are discordant
+  sample_gene_counts <- lapply(names(cross_data), function(sample_id) {
+    sample_result <- cross_data[[sample_id]]
+    if (!is.null(sample_result$gene_similarities)) {
+      total_genes <- nrow(sample_result$gene_similarities)
+      discordant_count <- sum(sample_result$gene_similarities$sim_combined < similarity_threshold, na.rm = TRUE)
+      return(data.frame(
+        sample_id = sample_id,
+        total_genes = total_genes,
+        discordant_genes = discordant_count,
+        pct_discordant = (discordant_count / total_genes) * 100
+      ))
+    } else {
+      return(NULL)
+    }
+  })
+  
+  # Combine sample gene counts
+  sample_gene_counts <- do.call(rbind, sample_gene_counts[!sapply(sample_gene_counts, is.null)])
+  
+  if (!is.null(sample_gene_counts) && nrow(sample_gene_counts) > 0) {
+    # Save sample gene counts
+    sample_counts_file <- file.path(output_dir, "sample_discordance_summary.csv")
+    write.csv(sample_gene_counts, sample_counts_file, row.names = FALSE)
+    
+    # Create sample discordance plot
+    sample_plot <- ggplot(sample_gene_counts, aes(x = reorder(sample_id, pct_discordant), 
+                                                 y = pct_discordant)) +
+      geom_bar(stat = "identity", fill = "purple", alpha = 0.7) +
+      labs(
+        title = "Percentage of Discordant Genes by Sample",
+        x = "Sample ID",
+        y = "% Discordant Genes"
+      ) +
+      theme_minimal() +
+      theme(
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+        plot.title = element_text(hjust = 0.5, face = "bold")
+      )
+    
+    # Save sample plot as JPEG
+    sample_plot_file <- file.path(output_dir, "sample_discordance_plot.jpg")
+    ggsave(sample_plot_file, sample_plot, width = 12, height = 6, device = "jpeg", dpi = 300)
+    cat("Saved sample discordance plot to:", sample_plot_file, "\n")
+  }
+  
+  # Return the processed data for further analysis if needed
+  return(list(
+    merged_data = merged_data,
+    chr_summary = chr_summary,
+    binned_data = binned_data,
+    sample_summary = sample_gene_counts
+  ))
+}
+
+# ============================================================================
+# MAIN ANALYSIS FUNCTION
+# ============================================================================
+
+analyze_discordant_genes <- function(results_base_dir, 
+                                    genes_with_id_path,
+                                    similarity_threshold, 
+                                    output_base_dir,
+                                    target_cross = NULL,
+                                    bin_size_mb = 5) {
+  
+  # Load gene coordinates
+  cat("Loading gene coordinates...\n")
+  gene_coords <- load_gene_coordinates(genes_with_id_path)
+  
+  # Load CCRIX results
+  cat("Loading CCRIX analysis results...\n")
+  results <- load_ccrix_results(results_base_dir, target_cross)
+  
+  # Create output directory if it doesn't exist
+  if (!dir.exists(output_base_dir)) {
+    dir.create(output_base_dir, recursive = TRUE)
+    cat("Created output directory:", output_base_dir, "\n")
+  }
+  
+  # Process each cross
+  all_cross_results <- list()
+  
+  for (cross_type in names(results)) {
+    if (length(results[[cross_type]]) == 0) {
+      cat("No samples found for cross:", cross_type, "\n")
+      next
+    }
+    
+    # Skip if targeting a specific cross and this isn't it
+    if (!is.null(target_cross) && target_cross != cross_type) {
+      next
+    }
+    
+    cat("\n==================================================\n")
+    cat("Analyzing discordant genes for cross:", cross_type, "\n")
+    cat("==================================================\n")
+    
+    # Create cross-specific output directory
+    cross_output_dir <- file.path(output_base_dir, cross_type)
+    if (!dir.exists(cross_output_dir)) {
+      dir.create(cross_output_dir, recursive = TRUE)
+    }
+    
+    # Analyze this cross
+    cross_result <- analyze_all_chromosomes(
+      cross_data = results[[cross_type]],
+      gene_coords = gene_coords,
+      similarity_threshold = similarity_threshold,
+      bin_size_mb = bin_size_mb,
+      output_dir = cross_output_dir
+    )
+    
+    # Store results
+    if (!is.null(cross_result)) {
+      all_cross_results[[cross_type]] <- cross_result
+    }
+  }
+  
+  # If there are multiple crosses, create a cross comparison
+  if (length(all_cross_results) > 1) {
+    cat("\nCreating cross comparison visualizations...\n")
+    
+    # Combine chromosome summaries from all crosses
+    chr_summaries <- lapply(names(all_cross_results), function(cross) {
+      summary <- all_cross_results[[cross]]$chr_summary
+      summary$cross <- cross
+      return(summary)
+    })
+    
+    combined_chr_summary <- do.call(rbind, chr_summaries)
+    
+    # Create comparison plot
+    comparison_plot <- ggplot(combined_chr_summary, 
+                             aes(x = chromosome_name, y = discordant_count, fill = cross)) +
+      geom_bar(stat = "identity", position = "dodge") +
+      labs(
+        title = "Discordant Gene Comparison Across Crosses",
+        x = "Chromosome",
+        y = "Number of Unique Discordant Genes",
+        fill = "Cross"
+      ) +
+      theme_minimal() +
+      theme(
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5, face = "bold")
+      )
+    
+    # Save comparison plot as JPEG
+    comparison_plot_file <- file.path(output_base_dir, "cross_comparison_discordant_genes.jpg")
+    ggsave(comparison_plot_file, comparison_plot, width = 14, height = 8, device = "jpeg", dpi = 300)
+    cat("Saved cross comparison plot to:", comparison_plot_file, "\n")
+    
+    # Save combined summary
+    combined_summary_file <- file.path(output_base_dir, "combined_chromosome_summary.csv")
+    write.csv(combined_chr_summary, combined_summary_file, row.names = FALSE)
+    
+    # Also create a concordance comparison if possible
+    if (all(sapply(all_cross_results, function(x) !is.null(x$binned_data)))) {
+      # Try to combine binned data for concordance comparison
+      binned_data_list <- lapply(names(all_cross_results), function(cross) {
+        binned <- all_cross_results[[cross]]$binned_data
+        binned$cross <- cross
+        return(binned)
+      })
+      
+      combined_binned_data <- do.call(rbind, binned_data_list)
+      
+      # Save combined binned data
+      combined_binned_file <- file.path(output_base_dir, "combined_binned_concordance_data.csv")
+      write.csv(combined_binned_data, combined_binned_file, row.names = FALSE)
+      
+      # For each chromosome, create a comparison plot
+      chromosomes <- unique(combined_binned_data$chromosome_name)
+      
+      # Create directory for comparison plots
+      comparison_dir <- file.path(output_base_dir, "Cross_Comparisons")
+      if (!dir.exists(comparison_dir)) {
+        dir.create(comparison_dir, recursive = TRUE)
+      }
+      
+      for (chr in chromosomes) {
+        # Filter data for this chromosome
+        chr_data <- combined_binned_data %>%
+          dplyr::filter(chromosome_name == chr, !is.na(pct_concordance))
+        
+        if (nrow(chr_data) > 0) {
+          # Create comparison plot
+          comp_plot <- ggplot(chr_data, aes(x = position_bin, y = pct_concordance, color = cross, group = cross)) +
+            geom_line(size = 1) +
+            geom_point(size = 1.5) +
+            ylim(0, 100) +
+            labs(
+              title = paste0("Concordance Comparison - Chromosome ", chr),
+              x = "Chromosome Position (Mb)",
+              y = "% Concordance",
+              color = "Cross"
+            ) +
+            theme_minimal() +
+            theme(
+              plot.title = element_text(hjust = 0.5, face = "bold")
+            )
+          
+          # Save comparison plot as JPEG
+          comp_plot_file <- file.path(comparison_dir, paste0("concordance_comparison_chr", chr, ".jpg"))
+          ggsave(comp_plot_file, comp_plot, width = 12, height = 8, device = "jpeg", dpi = 300)
+          cat("Saved concordance comparison for chromosome", chr, "to:", comp_plot_file, "\n")
+        }
+      }
+    }
+  }
+  
+  # Generate a summary report
+  cat("\nGenerating summary report...\n")
+  
+  report_file <- file.path(output_base_dir, "discordant_genes_report.txt")
+  sink(report_file)
+  
+  cat("Discordant Gene Analysis Report\n")
+  cat("===============================\n\n")
+  cat("Analysis Date:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n")
+  cat("Similarity Threshold:", similarity_threshold, "\n")
+  cat("Bin Size:", bin_size_mb, "Mb\n\n")
+  
+  for (cross_type in names(all_cross_results)) {
+    cat("\n---------------------------------------\n")
+    cat("Cross:", cross_type, "\n")
+    cat("---------------------------------------\n")
+    
+    cross_result <- all_cross_results[[cross_type]]
+    
+    # Get unique gene count
+    unique_genes <- unique(cross_result$merged_data$gene)
+    total_discordant <- length(unique_genes)
+    
+    cat("Total Unique Discordant Genes:", total_discordant, "\n\n")
+    
+    # Chromosome breakdown
+    cat("Chromosome Breakdown:\n")
+    print(cross_result$chr_summary[, c("chromosome_name", "discordant_count", "avg_sample_count")])
+    
+    # Top 5 bins with highest concordance
+    if (!is.null(cross_result$binned_data)) {
+      top_concordant_bins <- cross_result$binned_data %>%
+        dplyr::filter(total_gene_count >= 5) %>%  # Only include bins with at least 5 genes
+        dplyr::arrange(desc(pct_concordance)) %>%
+        dplyr::slice_head(n = 5)
+      
+      # Top 5 bins with lowest concordance
+      bottom_concordant_bins <- cross_result$binned_data %>%
+        dplyr::filter(total_gene_count >= 5) %>%  # Only include bins with at least 5 genes
+        dplyr::arrange(pct_concordance) %>%
+        dplyr::slice_head(n = 5)
+      
+      cat("\nTop 5 Regions with Highest Concordance (min 5 genes):\n")
+      print(top_concordant_bins[, c("chromosome_name", "position_bin_label", "total_gene_count", "pct_concordance")])
+      
+      cat("\nTop 5 Regions with Lowest Concordance (min 5 genes):\n")
+      print(bottom_concordant_bins[, c("chromosome_name", "position_bin_label", "total_gene_count", "pct_concordance")])
+    }
+    
+    cat("\n")
+    
+    # Sample statistics - if available
+    if (!is.null(cross_result$sample_summary) && nrow(cross_result$sample_summary) > 0) {
+      cat("\nSample Summary Statistics:\n")
+      cat("Average % of discordant genes per sample:", 
+          round(mean(cross_result$sample_summary$pct_discordant), 2), "%\n")
+      cat("Range of % discordant genes:", 
+          round(min(cross_result$sample_summary$pct_discordant), 2), "% to",
+          round(max(cross_result$sample_summary$pct_discordant), 2), "%\n")
+    }
+  }
+  
+  sink()
+  cat("Summary report generated at:", report_file, "\n")
+  
+  cat("\n==================================================\n")
+  cat("Discordant gene analysis completed successfully!\n")
+  cat("Output files are in:", output_base_dir, "\n")
+  cat("==================================================\n")
+  
+  return(all_cross_results)
+}
+
+# ============================================================================
+# RUN THE ANALYSIS
+# ============================================================================
+
+# Execute the analysis with the parameters defined at the top of the script
+discordant_results <- analyze_discordant_genes(
+  results_base_dir = results_base_dir,
+  genes_with_id_path = genes_with_id_path,
+  similarity_threshold = similarity_threshold,
+  output_base_dir = output_base_dir,
+  target_cross = target_cross,
+  bin_size_mb = bin_size_mb
+)
+```
+
+```{r}
+# ============================================================================
+# Discordant Gene Analysis for CC Data
+# ============================================================================
+
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(gridExtra)
+
+# ============================================================================
+# CONFIGURATION - MODIFY THESE PARAMETERS
+# ============================================================================
+
+# Base directory where CCRIX analysis results are stored
+results_base_dir <- "Results/CC"
+
+genes_with_id_path <- NULL  # Set to NULL if genes_with_id is already in the environment
+
+# Similarity threshold below which a gene is considered discordant
+similarity_threshold <- 0.7
+
+# Output directory for discordant gene analysis
+output_base_dir <- "Results/CC_Discordant"
+
+# Optional: Specify a single cross to analyze (e.g., "CC001xCC019")
+# Set to NULL to analyze all crosses
+target_cross <- NULL
+
+# Bin size for chromosome position binning (in Mb)
+bin_size_mb <- 5
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+# Function to load gene coordinates if not already in environment
+load_gene_coordinates <- function(genes_with_id_path) {
+  if (!is.null(genes_with_id_path) && file.exists(genes_with_id_path)) {
+    return(readRDS(genes_with_id_path))
+  } else if (exists("genes_with_id")) {
+    return(get("genes_with_id"))
+  } else {
+    stop("Gene coordinates not found. Please provide a valid path or ensure 'genes_with_id' is loaded.")
+  }
+}
+
+# Function to load CCRIX analysis results
+load_ccrix_results <- function(results_base_dir, target_cross = NULL) {
+  # If target_cross is specified, load only that cross's results
+  if (!is.null(target_cross)) {
+    # Look directly in the cross-specific directory
+    cross_dir <- file.path(results_base_dir, target_cross, "Cosine")
+    results_file <- file.path(cross_dir, paste0(target_cross, "_cosine_raw_results.rds"))
+    
+    if (file.exists(results_file)) {
+      cat("Loading results for cross", target_cross, "from", results_file, "\n")
+      results <- list()
+      results[[target_cross]] <- readRDS(results_file)
+      return(results)
+    } else {
+      stop("Results file not found for cross: ", target_cross, " at path: ", results_file)
+    }
+  } else {
+    # Load all crosses
+    results <- list()
+    cross_dirs <- list.dirs(results_base_dir, full.names = FALSE, recursive = FALSE)
+    
+    for (cross in cross_dirs) {
+      if (grepl("^CC\\d+xCC\\d+$", cross)) {  # Only process directories that look like crosses
+        cross_file <- file.path(results_base_dir, cross, "Cosine", paste0(cross, "_cosine_raw_results.rds"))
+        if (file.exists(cross_file)) {
+          cat("Loading results for cross", cross, "from", cross_file, "\n")
+          results[[cross]] <- readRDS(cross_file)
+        }
+      }
+    }
+    
+    if (length(results) > 0) {
+      return(results)
+    } else {
+      stop("No CCRIX analysis results found in:", results_base_dir)
+    }
+  }
+}
+
+# Modified function to identify discordant genes for a sample - ONLY using sim_strain
+identify_sample_discordant_genes <- function(sample_result, similarity_threshold) {
+  if (is.null(sample_result) || is.null(sample_result$gene_similarities)) {
+    return(NULL)
+  }
+  
+  # Get gene similarities
+  gene_data <- sample_result$gene_similarities
+  
+  # Check if sim_strain exists
+  if ("sim_strain" %in% colnames(gene_data)) {
+    discordant_genes <- gene_data %>%
+      dplyr::filter(sim_strain < similarity_threshold) %>%
+      dplyr::mutate(
+        sample_id = sample_result$sample_id
+      )
+  } else {
+    cat("'sim_strain' not found in gene similarities data.\n")
+    cat("Available columns:", paste(colnames(gene_data), collapse=", "), "\n")
+    return(NULL)
+  }
+  
+  return(discordant_genes)
+}
+
+# Function to merge discordant genes with genomic coordinates
+merge_discordant_with_coordinates <- function(discordant_genes, gene_coords) {
+  # Standardize gene identifiers
+  gene_coords$gene_id <- gene_coords$ensembl_gene_id
+  
+  # For each gene in discordant_genes, find its coordinates
+  merged_data <- discordant_genes %>%
+    dplyr::left_join(
+      gene_coords %>% 
+        dplyr::select(gene_id, chromosome_name, start_position, end_position),
+      by = c("gene" = "gene_id")
+    )
+  
+  # Calculate gene midpoint position in Mb
+  merged_data <- merged_data %>%
+    dplyr::mutate(
+      midpoint_mb = (start_position + end_position) / 2000000,  # Convert to Mb
+      chromosome_name = as.character(chromosome_name)
+    )
+  
+  return(merged_data)
+}
+
+# Modified function to calculate concordance percentage by bin
+bin_chromosome_positions <- function(merged_data, all_genes_by_chr, bin_size_mb = 5) {
+  # First, identify unique discordant genes and their positions
+  unique_discordant_genes <- merged_data %>%
+    dplyr::select(gene, chromosome_name, midpoint_mb) %>%
+    dplyr::distinct()
+  
+  # Create bins for all chromosomes present in the data
+  chromosomes <- unique(unique_discordant_genes$chromosome_name)
+  
+  # Create a list to store results for each chromosome
+  binned_results <- list()
+  
+  for (chr in chromosomes) {
+    # Get all genes for this chromosome from the reference
+    chr_all_genes <- all_genes_by_chr[[chr]]
+    if (is.null(chr_all_genes) || length(chr_all_genes) == 0) {
+      next
+    }
+    
+    # Get discordant genes for this chromosome
+    chr_discordant_genes <- unique_discordant_genes %>%
+      dplyr::filter(chromosome_name == chr)
+    
+    # Calculate min and max positions based on all genes in the chromosome
+    min_pos <- floor(min(chr_all_genes$midpoint_mb) / bin_size_mb) * bin_size_mb
+    max_pos <- ceiling(max(chr_all_genes$midpoint_mb) / bin_size_mb) * bin_size_mb
+    
+    # Create bins from min to max position
+    bins <- seq(min_pos, max_pos, by = bin_size_mb)
+    
+    # Initialize bin data
+    bin_data <- data.frame(
+      chromosome_name = chr,
+      position_bin = bins,
+      position_bin_label = paste0(bins, "-", bins + bin_size_mb),
+      total_gene_count = 0,
+      discordant_count = 0,
+      pct_concordance = 0
+    )
+    
+    # Count total genes in each bin
+    for (i in 1:length(bins)) {
+      bin_start <- bins[i]
+      bin_end <- bin_start + bin_size_mb
+      
+      # Count all genes in this bin
+      bin_data$total_gene_count[i] <- sum(
+        chr_all_genes$midpoint_mb >= bin_start & 
+        chr_all_genes$midpoint_mb < bin_end
+      )
+      
+      # Count discordant genes in this bin
+      bin_data$discordant_count[i] <- sum(
+        chr_discordant_genes$midpoint_mb >= bin_start & 
+        chr_discordant_genes$midpoint_mb < bin_end
+      )
+    }
+    
+    # Calculate concordance percentage (avoiding division by zero)
+    bin_data <- bin_data %>%
+      dplyr::mutate(
+        pct_concordance = ifelse(
+          total_gene_count > 0,
+          100 * (1 - (discordant_count / total_gene_count)),
+          NA
+        )
+      )
+    
+    # Store results for this chromosome
+    binned_results[[chr]] <- bin_data
+  }
+  
+  # Combine all chromosome results
+  binned_data <- do.call(rbind, binned_results)
+  
+  return(binned_data)
+}
+
+# Function to create chromosome position plots with concordance percentage
+create_chromosome_concordance_plot <- function(binned_data, chromosome, title = NULL) {
+  # Filter data for the specified chromosome
+  chr_data <- binned_data %>%
+    dplyr::filter(chromosome_name == chromosome) %>%
+    dplyr::filter(!is.na(pct_concordance))  # Remove bins with no genes
+  
+  # If no data for this chromosome, return NULL
+  if (nrow(chr_data) == 0) {
+    return(NULL)
+  }
+  
+  # Create plot
+  plot_title <- ifelse(
+    is.null(title),
+    paste0("Gene Concordance Distribution - Chromosome ", chromosome),
+    title
+  )
+  
+  p <- ggplot(chr_data, aes(x = position_bin, y = pct_concordance)) +
+    geom_line(color = "blue", size = 1) +
+    geom_point(size = 2, color = "blue") +
+    ylim(0, 100) +
+    labs(
+      title = plot_title,
+      x = "Chromosome Position (Mb)",
+      y = "% Concordance"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold")
+    )
+  
+  return(p)
+}
+
+# Function to analyze discordant genes across all chromosomes
+analyze_all_chromosomes <- function(cross_data, gene_coords, similarity_threshold, bin_size_mb,
+                                   output_dir) {
+  # Create list to store all discordant genes
+  all_discordant <- list()
+  
+  # Process each sample
+  for (sample_id in names(cross_data)) {
+    cat("Processing sample:", sample_id, "\n")
+    sample_result <- cross_data[[sample_id]]
+    
+    # Identify discordant genes
+    discordant_genes <- identify_sample_discordant_genes(sample_result, similarity_threshold)
+    
+    if (!is.null(discordant_genes) && nrow(discordant_genes) > 0) {
+      all_discordant[[sample_id]] <- discordant_genes
+    }
+  }
+  
+  # Combine all discordant genes
+  if (length(all_discordant) == 0) {
+    cat("No discordant genes found for any sample.\n")
+    return(NULL)
+  }
+  
+  combined_discordant <- do.call(rbind, all_discordant)
+  
+  # Merge with genomic coordinates
+  merged_data <- merge_discordant_with_coordinates(combined_discordant, gene_coords)
+  
+  # Save the complete merged data
+  full_data_file <- file.path(output_dir, "all_discordant_genes_with_coords.csv")
+  write.csv(merged_data, full_data_file, row.names = FALSE)
+  cat("Saved all discordant genes with coordinates to:", full_data_file, "\n")
+  
+  # Filter out entries with missing chromosomes or positions
+  valid_data <- merged_data %>% 
+    dplyr::filter(!is.na(chromosome_name) & !is.na(midpoint_mb))
+  
+  if (nrow(valid_data) == 0) {
+    cat("No valid chromosome coordinate data found for discordant genes.\n")
+    return(NULL)
+  }
+  
+  # Prepare all genes with chromosome positions (for denominator in concordance calculation)
+  all_genes_by_chr <- gene_coords %>%
+    dplyr::mutate(
+      midpoint_mb = (start_position + end_position) / 2000000,  # Convert to Mb
+      chromosome_name = as.character(chromosome_name)
+    ) %>%
+    split(.$chromosome_name)
+  
+  # Count unique discordant genes by chromosome
+  chr_summary <- valid_data %>%
+    dplyr::group_by(chromosome_name, gene) %>%
+    dplyr::summarize(
+      sample_count = n_distinct(sample_id),
+      .groups = "drop"
+    ) %>%
+    dplyr::group_by(chromosome_name) %>%
+    dplyr::summarize(
+      discordant_count = n(),  # Count unique genes, not sample×gene combinations
+      avg_sample_count = mean(sample_count, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    dplyr::arrange(chromosome_name)
+  
+  # Save chromosome summary
+  chr_summary_file <- file.path(output_dir, "chromosome_discordance_summary.csv")
+  write.csv(chr_summary, chr_summary_file, row.names = FALSE)
+  cat("Saved chromosome discordance summary to:", chr_summary_file, "\n")
+  
+  # Create binned data for visualization with concordance percentage
+  binned_data <- bin_chromosome_positions(valid_data, all_genes_by_chr, bin_size_mb)
+  
+  # Save binned data
+  binned_data_file <- file.path(output_dir, "binned_concordance_data.csv")
+  write.csv(binned_data, binned_data_file, row.names = FALSE)
+  
+  # Create individual chromosome plots
+  chromosomes <- unique(valid_data$chromosome_name)
+  chromosomes <- sort(chromosomes)  # Sort chromosomes
+  
+  # Create a directory for chromosome plots
+  chr_plots_dir <- file.path(output_dir, "Chromosome_Plots")
+  if (!dir.exists(chr_plots_dir)) {
+    dir.create(chr_plots_dir, recursive = TRUE)
+  }
+  
+  # Generate individual chromosome plots
+  plot_list <- list()
+  
+  for (chr in chromosomes) {
+    cat("Creating concordance plot for chromosome:", chr, "\n")
+    
+    # Make plot
+    chr_plot <- create_chromosome_concordance_plot(binned_data, chr)
+    
+    if (!is.null(chr_plot)) {
+      plot_list[[chr]] <- chr_plot
+      
+      # Save individual plot as JPEG instead of PDF
+      plot_file <- file.path(chr_plots_dir, paste0("concordance_chr", chr, ".jpg"))
+      ggsave(plot_file, chr_plot, width = 10, height = 6, device = "jpeg", dpi = 300)
+    }
+  }
+  
+  # Create genome-wide summary plot (all chromosomes)
+  combined_plot_file <- file.path(output_dir, "genome_wide_concordance.jpg")
+  
+  if (length(plot_list) > 0) {
+    # Arrange multiple plots in a grid
+    n_plots <- length(plot_list)
+    n_cols <- min(3, n_plots)
+    n_rows <- ceiling(n_plots / n_cols)
+    
+    combined_plot <- gridExtra::grid.arrange(
+      grobs = plot_list,
+      ncol = n_cols,
+      nrow = n_rows,
+      top = "Genome-Wide Gene Concordance Distribution"
+    )
+    
+    # Save the combined plot as JPEG
+    ggsave(combined_plot_file, combined_plot, width = 18, height = 12, device = "jpeg", dpi = 300)
+    cat("Saved genome-wide concordance plot to:", combined_plot_file, "\n")
+  } else {
+    cat("No chromosome plots were generated.\n")
+  }
+  
+  # Create summary visualizations
+  
+  # 1. Chromosome bar plot - showing unique gene counts
+  chr_summary_plot <- ggplot(chr_summary, aes(x = reorder(chromosome_name, discordant_count), 
+                                             y = discordant_count)) +
+    geom_bar(stat = "identity", fill = "darkred", alpha = 0.7) +
+    geom_text(aes(label = discordant_count), vjust = -0.3) +
+    labs(
+      title = "Discordant Genes by Chromosome",
+      x = "Chromosome",
+      y = "Number of Unique Discordant Genes"
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      plot.title = element_text(hjust = 0.5, face = "bold")
+    )
+  
+  # Save chromosome summary plot as JPEG
+  chr_summary_plot_file <- file.path(output_dir, "discordant_genes_by_chromosome.jpg")
+  ggsave(chr_summary_plot_file, chr_summary_plot, width = 12, height = 8, device = "jpeg", dpi = 300)
+  cat("Saved discordant genes by chromosome plot to:", chr_summary_plot_file, "\n")
+  
+  # 2. Calculate percentage of genes in each sample that are discordant
+  sample_gene_counts <- lapply(names(cross_data), function(sample_id) {
+    sample_result <- cross_data[[sample_id]]
+    if (!is.null(sample_result$gene_similarities)) {
+      total_genes <- nrow(sample_result$gene_similarities)
+      
+      # Check for sim_strain column
+      if ("sim_strain" %in% colnames(sample_result$gene_similarities)) {
+        discordant_count <- sum(sample_result$gene_similarities$sim_strain < similarity_threshold, na.rm = TRUE)
+        
+        return(data.frame(
+          sample_id = sample_id,
+          total_genes = total_genes,
+          discordant_genes = discordant_count,
+          pct_discordant = (discordant_count / total_genes) * 100
+        ))
+      } else {
+        cat("Warning: 'sim_strain' column not found for sample", sample_id, "\n")
+        return(NULL)
+      }
+    } else {
+      return(NULL)
+    }
+  })
+  
+  # Combine sample gene counts
+  sample_gene_counts <- do.call(rbind, sample_gene_counts[!sapply(sample_gene_counts, is.null)])
+  
+  if (!is.null(sample_gene_counts) && nrow(sample_gene_counts) > 0) {
+    # Save sample gene counts
+    sample_counts_file <- file.path(output_dir, "sample_discordance_summary.csv")
+    write.csv(sample_gene_counts, sample_counts_file, row.names = FALSE)
+    
+    # Create sample discordance plot
+    sample_plot <- ggplot(sample_gene_counts, aes(x = reorder(sample_id, pct_discordant), 
+                                                 y = pct_discordant)) +
+      geom_bar(stat = "identity", fill = "purple", alpha = 0.7) +
+      labs(
+        title = "Percentage of Discordant Genes by Sample",
+        x = "Sample ID",
+        y = "% Discordant Genes"
+      ) +
+      theme_minimal() +
+      theme(
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+        plot.title = element_text(hjust = 0.5, face = "bold")
+      )
+    
+    # Save sample plot as JPEG
+    sample_plot_file <- file.path(output_dir, "sample_discordance_plot.jpg")
+    ggsave(sample_plot_file, sample_plot, width = 12, height = 6, device = "jpeg", dpi = 300)
+    cat("Saved sample discordance plot to:", sample_plot_file, "\n")
+  }
+  
+  # Return the processed data for further analysis if needed
+  return(list(
+    merged_data = merged_data,
+    chr_summary = chr_summary,
+    binned_data = binned_data,
+    sample_summary = sample_gene_counts
+  ))
+}
+
+# ============================================================================
+# MAIN ANALYSIS FUNCTION
+# ============================================================================
+
+analyze_discordant_genes <- function(results_base_dir, 
+                                    genes_with_id_path,
+                                    similarity_threshold, 
+                                    output_base_dir,
+                                    target_cross = NULL,
+                                    bin_size_mb = 5) {
+  
+  # Load gene coordinates
+  cat("Loading gene coordinates...\n")
+  gene_coords <- load_gene_coordinates(genes_with_id_path)
+  
+  # Load CCRIX results
+  cat("Loading CCRIX analysis results...\n")
+  results <- load_ccrix_results(results_base_dir, target_cross)
+  
+  # Create output directory if it doesn't exist
+  if (!dir.exists(output_base_dir)) {
+    dir.create(output_base_dir, recursive = TRUE)
+    cat("Created output directory:", output_base_dir, "\n")
+  }
+  
+  # Process each cross
+  all_cross_results <- list()
+  
+  for (cross_type in names(results)) {
+    if (length(results[[cross_type]]) == 0) {
+      cat("No samples found for cross:", cross_type, "\n")
+      next
+    }
+    
+    # Skip if targeting a specific cross and this isn't it
+    if (!is.null(target_cross) && target_cross != cross_type) {
+      next
+    }
+    
+    cat("\n==================================================\n")
+    cat("Analyzing discordant genes for cross:", cross_type, "\n")
+    cat("==================================================\n")
+    
+    # Create cross-specific output directory
+    cross_output_dir <- file.path(output_base_dir, cross_type)
+    if (!dir.exists(cross_output_dir)) {
+      dir.create(cross_output_dir, recursive = TRUE)
+    }
+    
+    # Analyze this cross
+    cross_result <- analyze_all_chromosomes(
+      cross_data = results[[cross_type]],
+      gene_coords = gene_coords,
+      similarity_threshold = similarity_threshold,
+      bin_size_mb = bin_size_mb,
+      output_dir = cross_output_dir
+    )
+    
+    # Store results
+    if (!is.null(cross_result)) {
+      all_cross_results[[cross_type]] <- cross_result
+    }
+  }
+  
+  # If there are multiple crosses, create a cross comparison
+  if (length(all_cross_results) > 1) {
+    cat("\nCreating cross comparison visualizations...\n")
+    
+    # Combine chromosome summaries from all crosses
+    chr_summaries <- lapply(names(all_cross_results), function(cross) {
+      summary <- all_cross_results[[cross]]$chr_summary
+      summary$cross <- cross
+      return(summary)
+    })
+    
+    combined_chr_summary <- do.call(rbind, chr_summaries)
+    
+    # Create comparison plot
+    comparison_plot <- ggplot(combined_chr_summary, 
+                             aes(x = chromosome_name, y = discordant_count, fill = cross)) +
+      geom_bar(stat = "identity", position = "dodge") +
+      labs(
+        title = "Discordant Gene Comparison Across Crosses",
+        x = "Chromosome",
+        y = "Number of Unique Discordant Genes",
+        fill = "Cross"
+      ) +
+      theme_minimal() +
+      theme(
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5, face = "bold")
+      )
+    
+    # Save comparison plot as JPEG
+    comparison_plot_file <- file.path(output_base_dir, "cross_comparison_discordant_genes.jpg")
+    ggsave(comparison_plot_file, comparison_plot, width = 14, height = 8, device = "jpeg", dpi = 300)
+    cat("Saved cross comparison plot to:", comparison_plot_file, "\n")
+    
+    # Save combined summary
+    combined_summary_file <- file.path(output_base_dir, "combined_chromosome_summary.csv")
+    write.csv(combined_chr_summary, combined_summary_file, row.names = FALSE)
+    
+    # Also create a concordance comparison if possible
+    if (all(sapply(all_cross_results, function(x) !is.null(x$binned_data)))) {
+      # Try to combine binned data for concordance comparison
+      binned_data_list <- lapply(names(all_cross_results), function(cross) {
+        binned <- all_cross_results[[cross]]$binned_data
+        binned$cross <- cross
+        return(binned)
+      })
+      
+      combined_binned_data <- do.call(rbind, binned_data_list)
+      
+      # Save combined binned data
+      combined_binned_file <- file.path(output_base_dir, "combined_binned_concordance_data.csv")
+      write.csv(combined_binned_data, combined_binned_file, row.names = FALSE)
+      
+      # For each chromosome, create a comparison plot
+      chromosomes <- unique(combined_binned_data$chromosome_name)
+      
+      # Create directory for comparison plots
+      comparison_dir <- file.path(output_base_dir, "Cross_Comparisons")
+      if (!dir.exists(comparison_dir)) {
+        dir.create(comparison_dir, recursive = TRUE)
+      }
+      
+      for (chr in chromosomes) {
+        # Filter data for this chromosome
+        chr_data <- combined_binned_data %>%
+          dplyr::filter(chromosome_name == chr, !is.na(pct_concordance))
+        
+        if (nrow(chr_data) > 0) {
+          # Create comparison plot
+          comp_plot <- ggplot(chr_data, aes(x = position_bin, y = pct_concordance, color = cross, group = cross)) +
+            geom_line(size = 1) +
+            geom_point(size = 1.5) +
+            ylim(0, 100) +
+            labs(
+              title = paste0("Concordance Comparison - Chromosome ", chr),
+              x = "Chromosome Position (Mb)",
+              y = "% Concordance",
+              color = "Cross"
+            ) +
+            theme_minimal() +
+            theme(
+              plot.title = element_text(hjust = 0.5, face = "bold")
+            )
+          
+          # Save comparison plot as JPEG
+          comp_plot_file <- file.path(comparison_dir, paste0("concordance_comparison_chr", chr, ".jpg"))
+          ggsave(comp_plot_file, comp_plot, width = 12, height = 8, device = "jpeg", dpi = 300)
+          cat("Saved concordance comparison for chromosome", chr, "to:", comp_plot_file, "\n")
+        }
+      }
+    }
+  }
+  
+  # Generate a summary report
+  cat("\nGenerating summary report...\n")
+  
+  report_file <- file.path(output_base_dir, "discordant_genes_report.txt")
+  sink(report_file)
+  
+  cat("Discordant Gene Analysis Report\n")
+  cat("===============================\n\n")
+  cat("Analysis Date:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n")
+  cat("Similarity Threshold:", similarity_threshold, "\n")
+  cat("Bin Size:", bin_size_mb, "Mb\n\n")
+  
+  for (cross_type in names(all_cross_results)) {
+    cat("\n---------------------------------------\n")
+    cat("Cross:", cross_type, "\n")
+    cat("---------------------------------------\n")
+    
+    cross_result <- all_cross_results[[cross_type]]
+    
+    # Get unique gene count
+    unique_genes <- unique(cross_result$merged_data$gene)
+    total_discordant <- length(unique_genes)
+    
+    cat("Total Unique Discordant Genes:", total_discordant, "\n\n")
+    
+    # Chromosome breakdown
+    cat("Chromosome Breakdown:\n")
+    print(cross_result$chr_summary[, c("chromosome_name", "discordant_count", "avg_sample_count")])
+    
+    # Top 5 bins with highest concordance
+    if (!is.null(cross_result$binned_data)) {
+      top_concordant_bins <- cross_result$binned_data %>%
+        dplyr::filter(total_gene_count >= 5) %>%  # Only include bins with at least 5 genes
+        dplyr::arrange(desc(pct_concordance)) %>%
+        dplyr::slice_head(n = 5)
+      
+      # Top 5 bins with lowest concordance
+      bottom_concordant_bins <- cross_result$binned_data %>%
+        dplyr::filter(total_gene_count >= 5) %>%  # Only include bins with at least 5 genes
+        dplyr::arrange(pct_concordance) %>%
+        dplyr::slice_head(n = 5)
+      
+      cat("\nTop 5 Regions with Highest Concordance (min 5 genes):\n")
+      print(top_concordant_bins[, c("chromosome_name", "position_bin_label", "total_gene_count", "pct_concordance")])
+      
+      cat("\nTop 5 Regions with Lowest Concordance (min 5 genes):\n")
+      print(bottom_concordant_bins[, c("chromosome_name", "position_bin_label", "total_gene_count", "pct_concordance")])
+    }
+    
+    cat("\n")
+    
+    # Sample statistics - if available
+    if (!is.null(cross_result$sample_summary) && nrow(cross_result$sample_summary) > 0) {
+      cat("\nSample Summary Statistics:\n")
+      cat("Average % of discordant genes per sample:", 
+          round(mean(cross_result$sample_summary$pct_discordant), 2), "%\n")
+      cat("Range of % discordant genes:", 
+          round(min(cross_result$sample_summary$pct_discordant), 2), "% to",
+          round(max(cross_result$sample_summary$pct_discordant), 2), "%\n")
+    }
+  }
+  
+  sink()
+  cat("Summary report generated at:", report_file, "\n")
+  
+  cat("\n==================================================\n")
+  cat("Discordant gene analysis completed successfully!\n")
+  cat("Output files are in:", output_base_dir, "\n")
+  cat("==================================================\n")
+  
+  return(all_cross_results)
+}
+
+# ============================================================================
+# RUN THE ANALYSIS
+# ============================================================================
+
+# Execute the analysis with the parameters defined at the top of the script
+discordant_results <- analyze_discordant_genes(
+  results_base_dir = results_base_dir,
+  genes_with_id_path = genes_with_id_path,
+  similarity_threshold = similarity_threshold,
+  output_base_dir = output_base_dir,
+  target_cross = target_cross,
+  bin_size_mb = bin_size_mb
+)
+```
+
+```{r}
+# Visualize CCRIX with parental CC strains 
+
+# ============================================================================
+# Simplified Discordant Gene Analysis for CC Data - Concordance Comparisons Only
+# ============================================================================
+
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(gridExtra)
+library(cowplot)  # For get_legend function
+
+# ============================================================================
+# CONFIGURATION - MODIFY THESE PARAMETERS
+# ============================================================================
+
+# Base directory where CC analysis results are stored
+cc_results_dir <- "Results/CC"
+
+# Base directory where CCRIX G0 analysis results are stored
+ccrix_results_dir <- "Results/CCRIX_G0"
+
+genes_with_id_path <- NULL  # Set to NULL if genes_with_id is already in the environment
+
+# Similarity threshold below which a gene is considered discordant
+similarity_threshold <- 0.7
+
+# Output directory for discordant gene analysis
+output_base_dir <- "Results/CC_CCRIX_Comparison"
+
+# Bin size for chromosome position binning (in Mb)
+bin_size_mb <- 5
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+# Function to load gene coordinates if not already in environment
+load_gene_coordinates <- function(genes_with_id_path) {
+  if (!is.null(genes_with_id_path) && file.exists(genes_with_id_path)) {
+    return(readRDS(genes_with_id_path))
+  } else if (exists("genes_with_id")) {
+    return(get("genes_with_id"))
+  } else {
+    stop("Gene coordinates not found. Please provide a valid path or ensure 'genes_with_id' is loaded.")
+  }
+}
+
+# Function to load CC analysis results
+load_cc_results <- function(results_base_dir) {
+  results <- list()
+  cross_dirs <- list.dirs(results_base_dir, full.names = FALSE, recursive = FALSE)
+  
+  for (cross in cross_dirs) {
+    if (grepl("^CC\\d+xCC\\d+$", cross)) {  # Only process directories that look like crosses
+      cross_file <- file.path(results_base_dir, cross, "Cosine", paste0(cross, "_cosine_raw_results.rds"))
+      if (file.exists(cross_file)) {
+        cat("Loading results for cross", cross, "from", cross_file, "\n")
+        results[[cross]] <- readRDS(cross_file)
+      }
+    }
+  }
+  
+  if (length(results) > 0) {
+    return(results)
+  } else {
+    stop("No CC analysis results found in:", results_base_dir)
+  }
+}
+
+# Function to load CCRIX G0 analysis results
+load_ccrix_results <- function(results_base_dir) {
+  results <- list()
+  cross_dirs <- list.dirs(results_base_dir, full.names = FALSE, recursive = FALSE)
+  
+  for (cross in cross_dirs) {
+    if (grepl("^CC\\d+xCC\\d+$", cross)) {  # Only process directories that look like crosses
+      cross_file <- file.path(results_base_dir, cross, "Cosine", paste0(cross, "_cosine_raw_results.rds"))
+      if (file.exists(cross_file)) {
+        cat("Loading results for CCRIX cross", cross, "from", cross_file, "\n")
+        results[[cross]] <- readRDS(cross_file)
+      }
+    }
+  }
+  
+  if (length(results) > 0) {
+    return(results)
+  } else {
+    stop("No CCRIX G0 analysis results found in:", results_base_dir)
+  }
+}
+
+# Modified function to identify discordant genes for a sample - handles both CC and CCRIX formats
+identify_sample_discordant_genes <- function(sample_result, similarity_threshold, data_type = "CC") {
+  if (is.null(sample_result) || is.null(sample_result$gene_similarities)) {
+    return(NULL)
+  }
+  
+  # Get gene similarities
+  gene_data <- sample_result$gene_similarities
+  
+  # For CC data, use sim_strain column
+  if (data_type == "CC" && "sim_strain" %in% colnames(gene_data)) {
+    discordant_genes <- gene_data %>%
+      dplyr::filter(sim_strain < similarity_threshold) %>%
+      dplyr::mutate(
+        sample_id = sample_result$sample_id
+      )
+    return(discordant_genes)
+  }
+  # For CCRIX data, use sim_combined column
+  else if (data_type == "CCRIX" && "sim_combined" %in% colnames(gene_data)) {
+    discordant_genes <- gene_data %>%
+      dplyr::filter(sim_combined < similarity_threshold) %>%
+      dplyr::mutate(
+        sample_id = sample_result$sample_id
+      )
+    return(discordant_genes)
+  }
+  else {
+    available_cols <- paste(colnames(gene_data), collapse=", ")
+    cat("Required similarity column not found in gene similarities data.\n")
+    cat("Available columns:", available_cols, "\n")
+    return(NULL)
+  }
+}
+
+# Function to merge discordant genes with genomic coordinates
+merge_discordant_with_coordinates <- function(discordant_genes, gene_coords) {
+  # Standardize gene identifiers
+  gene_coords$gene_id <- gene_coords$ensembl_gene_id
+  
+  # For each gene in discordant_genes, find its coordinates
+  merged_data <- discordant_genes %>%
+    dplyr::left_join(
+      gene_coords %>% 
+        dplyr::select(gene_id, chromosome_name, start_position, end_position),
+      by = c("gene" = "gene_id")
+    )
+  
+  # Calculate gene midpoint position in Mb
+  merged_data <- merged_data %>%
+    dplyr::mutate(
+      midpoint_mb = (start_position + end_position) / 2000000,  # Convert to Mb
+      chromosome_name = as.character(chromosome_name)
+    )
+  
+  return(merged_data)
+}
+
+# Function to calculate concordance percentage by bin
+bin_chromosome_positions <- function(merged_data, all_genes_by_chr, bin_size_mb = 5) {
+  # First, identify unique discordant genes and their positions
+  unique_discordant_genes <- merged_data %>%
+    dplyr::select(gene, chromosome_name, midpoint_mb) %>%
+    dplyr::distinct()
+  
+  # Create bins for all chromosomes present in the data
+  chromosomes <- unique(unique_discordant_genes$chromosome_name)
+  
+  # Create a list to store results for each chromosome
+  binned_results <- list()
+  
+  for (chr in chromosomes) {
+    # Get all genes for this chromosome from the reference
+    chr_all_genes <- all_genes_by_chr[[chr]]
+    if (is.null(chr_all_genes) || length(chr_all_genes) == 0) {
+      next
+    }
+    
+    # Get discordant genes for this chromosome
+    chr_discordant_genes <- unique_discordant_genes %>%
+      dplyr::filter(chromosome_name == chr)
+    
+    # Calculate min and max positions based on all genes in the chromosome
+    min_pos <- floor(min(chr_all_genes$midpoint_mb) / bin_size_mb) * bin_size_mb
+    max_pos <- ceiling(max(chr_all_genes$midpoint_mb) / bin_size_mb) * bin_size_mb
+    
+    # Create bins from min to max position
+    bins <- seq(min_pos, max_pos, by = bin_size_mb)
+    
+    # Initialize bin data
+    bin_data <- data.frame(
+      chromosome_name = chr,
+      position_bin = bins,
+      position_bin_label = paste0(bins, "-", bins + bin_size_mb),
+      total_gene_count = 0,
+      discordant_count = 0,
+      pct_concordance = 0
+    )
+    
+    # Count total genes in each bin
+    for (i in 1:length(bins)) {
+      bin_start <- bins[i]
+      bin_end <- bin_start + bin_size_mb
+      
+      # Count all genes in this bin
+      bin_data$total_gene_count[i] <- sum(
+        chr_all_genes$midpoint_mb >= bin_start & 
+        chr_all_genes$midpoint_mb < bin_end
+      )
+      
+      # Count discordant genes in this bin
+      bin_data$discordant_count[i] <- sum(
+        chr_discordant_genes$midpoint_mb >= bin_start & 
+        chr_discordant_genes$midpoint_mb < bin_end
+      )
+    }
+    
+    # Calculate concordance percentage (avoiding division by zero)
+    bin_data <- bin_data %>%
+      dplyr::mutate(
+        pct_concordance = ifelse(
+          total_gene_count > 0,
+          100 * (1 - (discordant_count / total_gene_count)),
+          NA
+        )
+      )
+    
+    # Store results for this chromosome
+    binned_results[[chr]] <- bin_data
+  }
+  
+  # Combine all chromosome results
+  if (length(binned_results) > 0) {
+    binned_data <- do.call(rbind, binned_results)
+    return(binned_data)
+  } else {
+    return(NULL)
+  }
+}
+
+# Improved function to extract strain IDs from cross name
+extract_strains <- function(cross_name) {
+  # Match the pattern CCxxxCCyyy
+  matches <- regmatches(cross_name, regexec("CC(\\d+)xCC(\\d+)", cross_name))
+  if (length(matches) > 0 && length(matches[[1]]) > 2) {
+    strain1 <- as.numeric(matches[[1]][2])
+    strain2 <- as.numeric(matches[[1]][3])
+    return(c(strain1, strain2))
+  }
+  cat("Warning: Could not extract strains from cross name:", cross_name, "\n")
+  return(NULL)
+}
+
+# Function to process data and create concordance comparison visualizations
+create_concordance_comparisons <- function(cc_results, ccrix_results, gene_coords, 
+                                          similarity_threshold, bin_size_mb, output_dir) {
+  
+  # Define consistent colors for parent crosses and CCRIX
+  color_scheme <- c(
+    "CC001xCC001" = "red",
+    "CC019xCC019" = "blue",
+    "CC040xCC040" = "green",
+    "CCRIX" = "yellow"
+  )
+  
+  # Process CC results
+  cc_processed <- list()
+  for (cross in names(cc_results)) {
+    cat("\nProcessing CC cross:", cross, "\n")
+    
+    # Extract all discordant genes for this cross
+    all_discordant <- list()
+    for (sample_id in names(cc_results[[cross]])) {
+      sample_result <- cc_results[[cross]][[sample_id]]
+      discordant_genes <- identify_sample_discordant_genes(sample_result, similarity_threshold, data_type = "CC")
+      if (!is.null(discordant_genes) && nrow(discordant_genes) > 0) {
+        all_discordant[[sample_id]] <- discordant_genes
+      }
+    }
+    
+    if (length(all_discordant) == 0) {
+      cat("No discordant genes found for cross:", cross, "\n")
+      next
+    }
+    
+    # Combine all discordant genes
+    combined_discordant <- do.call(rbind, all_discordant)
+    
+    # Add cross identifier
+    combined_discordant$cross <- cross
+    combined_discordant$data_type <- "CC"
+    
+    # Extract strain IDs
+    strains <- extract_strains(cross)
+    if (!is.null(strains)) {
+      combined_discordant$strain1 <- strains[1]
+      combined_discordant$strain2 <- strains[2]
+    }
+    
+    # Merge with genomic coordinates
+    merged_data <- merge_discordant_with_coordinates(combined_discordant, gene_coords)
+    
+    # Store for comparison
+    cc_processed[[cross]] <- merged_data
+  }
+  
+  # Process CCRIX results
+  ccrix_processed <- list()
+  for (cross in names(ccrix_results)) {
+    cat("\nProcessing CCRIX cross:", cross, "\n")
+    
+    # Extract strain IDs
+    strains <- extract_strains(cross)
+    if (is.null(strains)) {
+      cat("Could not extract strains from cross name:", cross, "\n")
+      next
+    }
+    
+    # Extract all discordant genes for this cross
+    all_discordant <- list()
+    for (sample_id in names(ccrix_results[[cross]])) {
+      sample_result <- ccrix_results[[cross]][[sample_id]]
+      discordant_genes <- identify_sample_discordant_genes(sample_result, similarity_threshold, data_type = "CCRIX")
+      if (!is.null(discordant_genes) && nrow(discordant_genes) > 0) {
+        all_discordant[[sample_id]] <- discordant_genes
+      }
+    }
+    
+    if (length(all_discordant) == 0) {
+      cat("No discordant genes found for CCRIX cross:", cross, "\n")
+      next
+    }
+    
+    # Combine all discordant genes
+    combined_discordant <- do.call(rbind, all_discordant)
+    
+    # Add cross identifier
+    combined_discordant$cross <- cross
+    combined_discordant$data_type <- "CCRIX"
+    combined_discordant$strain1 <- strains[1]
+    combined_discordant$strain2 <- strains[2]
+    
+    # Merge with genomic coordinates
+    merged_data <- merge_discordant_with_coordinates(combined_discordant, gene_coords)
+    
+    # Store for comparison
+    ccrix_processed[[cross]] <- merged_data
+  }
+  
+  # Function to find parent crosses for a CCRIX cross
+  find_parent_crosses <- function(ccrix_cross, cc_crosses) {
+    strains <- extract_strains(ccrix_cross)
+    if (is.null(strains)) return(NULL)
+    
+    strain1 <- strains[1]
+    strain2 <- strains[2]
+    
+    # Look for parent crosses in the format CC001xCC001 and CC019xCC019 (with leading zeros)
+    parent1_cross <- sprintf("CC%03dxCC%03d", strain1, strain1)
+    parent2_cross <- sprintf("CC%03dxCC%03d", strain2, strain2)
+    
+    # Check if both parent crosses exist in cc_crosses
+    parents <- c()
+    if (parent1_cross %in% names(cc_crosses)) {
+      parents <- c(parents, parent1_cross)
+    } else {
+      cat("Warning: Parent cross", parent1_cross, "not found for CCRIX cross", ccrix_cross, "\n")
+    }
+    
+    if (parent2_cross %in% names(cc_crosses)) {
+      parents <- c(parents, parent2_cross)
+    } else {
+      cat("Warning: Parent cross", parent2_cross, "not found for CCRIX cross", ccrix_cross, "\n")
+    }
+    
+    if (length(parents) > 0) {
+      return(parents)
+    } else {
+      return(NULL)
+    }
+  }
+  
+  # Create comparisons between CCRIX and parent CC data
+  if (length(cc_processed) > 0 && length(ccrix_processed) > 0) {
+    cat("\nCreating CCRIX and parent CC strain comparisons...\n")
+    
+    # Create base output directory for comparisons
+    base_comparison_dir <- file.path(output_dir, "Cross_Comparisons")
+    if (!dir.exists(base_comparison_dir)) {
+      dir.create(base_comparison_dir, recursive = TRUE)
+    }
+    
+    # Prepare all genes with chromosome positions (for denominator in concordance calculation)
+    all_genes_by_chr <- gene_coords %>%
+      dplyr::mutate(
+        midpoint_mb = (start_position + end_position) / 2000000,  # Convert to Mb
+        chromosome_name = as.character(chromosome_name)
+      ) %>%
+      split(.$chromosome_name)
+    
+    # Process each CCRIX cross
+    for (ccrix_cross in names(ccrix_processed)) {
+      cat("\nProcessing comparison for CCRIX cross:", ccrix_cross, "\n")
+      
+      # Create cross-specific output directory
+      comparison_dir <- file.path(base_comparison_dir, ccrix_cross)
+      if (!dir.exists(comparison_dir)) {
+        dir.create(comparison_dir, recursive = TRUE)
+      }
+      
+      # Find parent crosses
+      parent_crosses <- find_parent_crosses(ccrix_cross, cc_processed)
+      
+      if (is.null(parent_crosses) || length(parent_crosses) == 0) {
+        cat("No parent crosses found for CCRIX cross:", ccrix_cross, "\n")
+        next
+      }
+      
+      cat("Found parent crosses:", paste(parent_crosses, collapse=", "), "\n")
+      
+      # Extract CCRIX strains for labeling
+      ccrix_strains <- extract_strains(ccrix_cross)
+      if (is.null(ccrix_strains)) next
+      
+      strain1 <- paste0("CC", sprintf("%03d", ccrix_strains[1]))
+      strain2 <- paste0("CC", sprintf("%03d", ccrix_strains[2]))
+      
+      # Get the combined columns from all datasets to ensure consistency
+      ccrix_data <- ccrix_processed[[ccrix_cross]]
+      parent1_data <- cc_processed[[parent_crosses[1]]]
+      parent2_data <- cc_processed[[parent_crosses[2]]]
+      
+      # Get a list of all column names across all three dataframes
+      all_cols <- unique(c(
+        colnames(ccrix_data), 
+        colnames(parent1_data), 
+        colnames(parent2_data)
+      ))
+      
+      # Function to ensure a dataframe has all necessary columns
+      ensure_columns <- function(df, required_cols) {
+        missing_cols <- setdiff(required_cols, colnames(df))
+        if (length(missing_cols) > 0) {
+          for (col in missing_cols) {
+            df[[col]] <- NA
+          }
+        }
+        return(df[, required_cols])
+      }
+      
+      # Ensure all dataframes have the same columns
+      ccrix_data <- ensure_columns(ccrix_data, all_cols)
+      parent1_data <- ensure_columns(parent1_data, all_cols)
+      parent2_data <- ensure_columns(parent2_data, all_cols)
+      
+      # Now combine data with consistent columns
+      combined_data <- rbind(
+        ccrix_data %>% mutate(group = "CCRIX", label = paste0(strain1, "x", strain2)),
+        parent1_data %>% mutate(group = "Parent1", label = parent_crosses[1]),
+        parent2_data %>% mutate(group = "Parent2", label = parent_crosses[2])
+      )
+      
+      # Only keep valid data with chromosome and position information
+      valid_data <- combined_data %>% 
+        dplyr::filter(!is.na(chromosome_name) & !is.na(midpoint_mb))
+      
+      if (nrow(valid_data) == 0) {
+        cat("No valid chromosome coordinate data found for cross comparison.\n")
+        next
+      }
+      
+      # Calculate binned data for each group
+      ccrix_data <- valid_data %>% filter(group == "CCRIX")
+      parent1_data <- valid_data %>% filter(group == "Parent1")
+      parent2_data <- valid_data %>% filter(group == "Parent2")
+      
+      ccrix_binned <- bin_chromosome_positions(ccrix_data, all_genes_by_chr, bin_size_mb)
+      if (!is.null(ccrix_binned)) {
+        ccrix_binned$group <- "CCRIX"
+        ccrix_binned$label <- paste0(strain1, "x", strain2)
+      } else {
+        cat("No binned data could be generated for CCRIX cross:", ccrix_cross, "\n")
+        next
+      }
+      
+      parent1_binned <- bin_chromosome_positions(parent1_data, all_genes_by_chr, bin_size_mb)
+      if (!is.null(parent1_binned)) {
+        parent1_binned$group <- "Parent1"
+        parent1_binned$label <- parent_crosses[1]
+      } else {
+        cat("No binned data could be generated for parent cross:", parent_crosses[1], "\n")
+        next
+      }
+      
+      parent2_binned <- bin_chromosome_positions(parent2_data, all_genes_by_chr, bin_size_mb)
+      if (!is.null(parent2_binned)) {
+        parent2_binned$group <- "Parent2"
+        parent2_binned$label <- parent_crosses[2]
+      } else {
+        cat("No binned data could be generated for parent cross:", parent_crosses[2], "\n")
+        next
+      }
+      
+      # Combine binned data
+      combined_binned <- rbind(ccrix_binned, parent1_binned, parent2_binned)
+      
+      # Save combined binned data
+      binned_data_file <- file.path(comparison_dir, paste0(ccrix_cross, "_binned_concordance_data.csv"))
+      write.csv(combined_binned, binned_data_file, row.names = FALSE)
+      
+      # Get all chromosomes
+      chromosomes <- unique(combined_binned$chromosome_name)
+      chromosomes <- sort(chromosomes)  # Sort chromosomes
+      
+      # Create chromosome-specific plots for this cross comparison
+      for (chr in chromosomes) {
+        # Filter data for this chromosome
+        chr_data <- combined_binned %>%
+          dplyr::filter(chromosome_name == chr, !is.na(pct_concordance))
+        
+        if (nrow(chr_data) > 0) {
+          # Set up colors based on the labels in the data
+          plot_colors <- c()
+          
+          # Add colors for parental strains (using consistent colors)
+          for (label in unique(chr_data$label)) {
+            if (label == paste0(strain1, "x", strain2)) {
+              # This is the CCRIX cross
+              plot_colors[label] <- "yellow"
+            } else if (label == "CC001xCC001") {
+              plot_colors[label] <- "red"
+            } else if (label == "CC019xCC019") {
+              plot_colors[label] <- "blue" 
+            } else if (label == "CC040xCC040") {
+              plot_colors[label] <- "green"
+            } else {
+              # Fallback color if we encounter an unexpected cross
+              plot_colors[label] <- "purple"
+            }
+          }
+          
+          # Create comparison plot
+          comp_plot <- ggplot(chr_data, 
+                             aes(x = position_bin, y = pct_concordance, 
+                                 color = label, group = label)) +
+            geom_line(linewidth = 1) +
+            geom_point(size = 1.5) +
+            ylim(0, 100) +
+            labs(
+              title = paste0("Concordance Comparison - Chromosome ", chr),
+              subtitle = paste0("CCRIX: ", strain1, "x", strain2, " vs Parent Strains"),
+              x = "Chromosome Position (Mb)",
+              y = "% Concordance",
+              color = "Cross"
+            ) +
+            scale_color_manual(values = plot_colors) +
+            theme_minimal() +
+            theme(
+              plot.title = element_text(hjust = 0.5, face = "bold"),
+              plot.subtitle = element_text(hjust = 0.5)
+            )
+          
+          # Save comparison plot as JPEG
+          comp_plot_file <- file.path(comparison_dir, 
+                                     paste0("concordance_chr", chr, ".jpg"))
+          ggsave(comp_plot_file, comp_plot, width = 12, height = 8, device = "jpeg", dpi = 300)
+          cat("Saved concordance comparison for chromosome", chr, "to:", comp_plot_file, "\n")
+        }
+      }
+    }
+  } else {
+    cat("\nWarning: Either no CC or no CCRIX data was processed successfully.\n")
+    cat("CC processed crosses:", length(cc_processed), "\n")
+    cat("CCRIX processed crosses:", length(ccrix_processed), "\n")
+  }
+  
+  cat("\n==================================================\n")
+  cat("Concordance comparison analysis completed successfully!\n")
+  cat("Output files are in:", output_dir, "\n")
+  cat("==================================================\n")
+}
+
+# ============================================================================
+# MAIN ANALYSIS FUNCTION
+# ============================================================================
+
+compare_cc_and_ccrix <- function(cc_results_dir, 
+                               ccrix_results_dir,
+                               genes_with_id_path,
+                               similarity_threshold,
+                               output_base_dir,
+                               bin_size_mb = 5) {
+  
+  # Load gene coordinates
+  cat("Loading gene coordinates...\n")
+  gene_coords <- load_gene_coordinates(genes_with_id_path)
+  
+  # Load CC and CCRIX results
+  cat("Loading CC analysis results...\n")
+  cc_results <- load_cc_results(cc_results_dir)
+  
+  cat("Loading CCRIX G0 analysis results...\n")
+  ccrix_results <- load_ccrix_results(ccrix_results_dir)
+  
+  # Create output directory if it doesn't exist
+  if (!dir.exists(output_base_dir)) {
+    dir.create(output_base_dir, recursive = TRUE)
+    cat("Created output directory:", output_base_dir, "\n")
+  }
+  
+  # Create concordance comparison visualizations
+  create_concordance_comparisons(
+    cc_results = cc_results,
+    ccrix_results = ccrix_results,
+    gene_coords = gene_coords,
+    similarity_threshold = similarity_threshold,
+    bin_size_mb = bin_size_mb,
+    output_dir = output_base_dir
+  )
+  
+  return(TRUE)
+}
+
+# ============================================================================
+# RUN THE ANALYSIS
+# ============================================================================
+
+# Execute the analysis with the parameters defined at the top of the script
+result <- compare_cc_and_ccrix(
+  cc_results_dir = cc_results_dir,
+  ccrix_results_dir = ccrix_results_dir,
+  genes_with_id_path = genes_with_id_path,
+  similarity_threshold = similarity_threshold,
+  output_base_dir = output_base_dir,
+  bin_size_mb = bin_size_mb
+)
+```
+
+# END
+
+# 
+
+## 

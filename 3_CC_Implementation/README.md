@@ -21,8 +21,6 @@ Required input for `1_GBRS_Pipeline/8_reconstruct.slurm`.
 | `tranprob.CC.G20.M.h5` | CC transition probability matrix — males, generation 20 (HDF5) |
 | `tranprob.CC.G20.F.npz` | Same as above (NumPy compressed format) |
 | `tranprob.CC.G20.M.npz` | Same as above (NumPy compressed format) |
-| `RIX_CC001xCC019.F.h5` | CCRIX (CC001×CC019) transition probability — females |
-| `RIX_CC019xCC001.F.h5` | CCRIX (CC019×CC001) transition probability — females |
 
 ### Reference Data (`Data/CC_indexes/`)
 
@@ -47,4 +45,4 @@ The output `.h5` files are then passed to `1_GBRS_Pipeline/8_reconstruct.slurm` 
 
 ## Notes
 
-- CCRIX transition probability generation is ongoing — the CC approach in `CC.trans.prob.Rmd` serves as the template to adapt for CCRIX crosses
+- CCRIX implementation is complete — see `4_CCRIX_Implementation/` for the full CCRIX validation workflow and results. Custom CCRIX transition probability files were not required; DO.G0 transprob files from the GBRS Zenodo reference (Lloyd 2025) are used instead.
