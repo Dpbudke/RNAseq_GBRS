@@ -6,7 +6,7 @@ SLURM-based HPC scripts for the full GBRS allele-specific expression pipeline in
 
 | Script | Step | Description |
 |--------|------|-------------|
-| `1_gbrs_alignment.slurm` | 1 | Bowtie2 alignment to CC diploid transcriptome |
+| `1_gbrs_alignment.slurm` | 1 | Bowtie2 alignment to pooled-founder transcriptome |
 | `2_bowtie_stats.slurm` | 2a | Summarize Bowtie2 alignment statistics |
 | `2_combine_txt_files.sh` | 2b | Combine alignment stat text files |
 | `3_bam_sort_index.slurm` | 3 | Sort and index BAM files (SAMtools) |
@@ -36,7 +36,7 @@ sbatch 3_bam_sort_index.slurm
 
 ## Reference Data
 
-The diploid transcriptome and founder genome files required by these scripts are archived on Zenodo (Dawson Budke is a contributor):
+The pooled-founder transcriptome and additional files required by these scripts are archived on Zenodo (Dawson Budke is a contributor):
 
 > Lloyd, Michael. (2025). *Reference Data for EMASE and GBRS*. Zenodo. https://doi.org/10.5281/zenodo.15091310
 
