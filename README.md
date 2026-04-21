@@ -29,7 +29,7 @@ Preprocessed FASTQs (from RNAseq_STAR)
     │
     ▼
 1_GBRS_Pipeline
-    ├── Bowtie2 alignment to CC diploid reference
+    ├── Bowtie2 alignment to pooled-founder reference
     ├── BAM sort/index
     ├── BAM → EMASE format
     ├── Multi-way alignment merge
@@ -54,7 +54,7 @@ Preprocessed FASTQs (from RNAseq_STAR)
 
 ## Reference Data
 
-Reference files required for EMASE and GBRS (diploid transcriptome, founder genomes, etc.) are archived on Zenodo:
+Reference files required for EMASE and GBRS (pooled-founder reference transcriptome, GBRS_DATA, etc.) are archived on Zenodo:
 
 > Lloyd, Michael. (2025). *Reference Data for EMASE and GBRS*. Zenodo. https://doi.org/10.5281/zenodo.15091310
 
